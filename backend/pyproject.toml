@@ -2,7 +2,7 @@
 name = "auction-ocr-backend"
 version = "0.1.0"
 description = "Auction OCR API"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "fastapi>=0.111",
   "uvicorn[standard]>=0.30",
@@ -23,8 +23,8 @@ dependencies = [
   "numpy>=1.26",
   "opencv-python-headless>=4.10",
   "pytesseract>=0.3.10",
-  "paddlepaddle>=3.3.0",
   "paddleocr[doc-parser]>=3.4.0",
+  "paddlepaddle-gpu==3.3.0",
 ]
 
 [project.optional-dependencies]
@@ -36,8 +36,12 @@ dev = [
   "mypy>=1.10",
 ]
 
+[[tool.uv.index]]
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+
 [tool.uv]
 package = false
+index-strategy = "unsafe-best-match"
 
 [tool.ruff]
 line-length = 100

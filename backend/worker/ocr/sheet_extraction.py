@@ -1,14 +1,47 @@
 from __future__ import annotations
 
+import os
 import cv2
 import numpy as np
 
 from worker.ocr.image_utils import OCRToken, crop_image
-from worker.ocr.ocr_engine import OCRResult, run_ocr
+from worker.ocr.ocr_engine import OCRResult, run_ocr, get_paddle_device
 
 
 MIN_SHEET_TOKENS = 10
 _VL_INSTANCE = None
+
+
+def _patch_paddle_tensor_int() -> None:
+    try:
+        import paddle
+    except Exception:
+        return
+
+    tensor_cls = getattr(paddle, "Tensor", None)
+    if tensor_cls is None:
+        return
+
+    current_int = getattr(tensor_cls, "__int__", None)
+    if current_int is None or getattr(current_int, "_auction_patch", False):
+        return
+
+    original_int = current_int
+
+    def _patched_int(self):
+        try:
+            return original_int(self)
+        except Exception:
+            try:
+                arr = self.numpy()
+            except Exception:
+                raise
+            if getattr(arr, "size", 0) == 1:
+                return int(arr.reshape(-1)[0])
+            raise
+
+    _patched_int._auction_patch = True
+    tensor_cls.__int__ = _patched_int
 
 
 def extract_sheet(image, sheet_bbox) -> OCRResult:
@@ -68,6 +101,7 @@ def extract_sheet(image, sheet_bbox) -> OCRResult:
     meta = best_result.meta or {}
     meta["token_count"] = len(offset_tokens)
     return OCRResult(engine=best_result.engine, tokens=offset_tokens, meta=meta)
+
 
 def _run_with_fallbacks(image: np.ndarray) -> tuple[OCRResult, int, bool]:
     best, best_rotation = _run_with_rotations(image)
@@ -148,8 +182,32 @@ def _map_point_from_rotated(
 
 
 def _run_paddle_vl(image: np.ndarray) -> tuple[list[OCRToken], dict]:
+    _patch_paddle_tensor_int()
     vl = _get_vl_instance()
-    results = vl.predict([image])
+    try:
+        predict_kwargs = {"use_queues": False}
+        max_new_tokens = os.getenv("PADDLEOCR_VL_MAX_NEW_TOKENS")
+        if max_new_tokens:
+            try:
+                predict_kwargs["max_new_tokens"] = int(max_new_tokens)
+            except ValueError:
+                pass
+        min_pixels = os.getenv("PADDLEOCR_VL_MIN_PIXELS")
+        if min_pixels:
+            try:
+                predict_kwargs["min_pixels"] = int(min_pixels)
+            except ValueError:
+                pass
+        max_pixels = os.getenv("PADDLEOCR_VL_MAX_PIXELS")
+        if max_pixels:
+            try:
+                predict_kwargs["max_pixels"] = int(max_pixels)
+            except ValueError:
+                pass
+        results = vl.predict([image], **predict_kwargs)
+    except Exception as exc:
+        return [], {"pipeline": "PaddleOCR-VL-1.5", "block_count": 0, "error": str(exc)}
+
     if not results:
         return [], {"pipeline": "PaddleOCR-VL-1.5", "block_count": 0}
 
@@ -165,7 +223,10 @@ def _get_vl_instance():
             from paddleocr import PaddleOCRVL
         except Exception as exc:  # pragma: no cover - required dependency
             raise RuntimeError("PaddleOCRVL dependency missing") from exc
-        _VL_INSTANCE = PaddleOCRVL(pipeline_version="v1.5")
+        _VL_INSTANCE = PaddleOCRVL(
+            pipeline_version="v1.5",
+            device=get_paddle_device(),
+        )
     return _VL_INSTANCE
 
 

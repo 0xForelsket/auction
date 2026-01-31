@@ -5,7 +5,7 @@ import html as html_lib
 import re
 
 from worker.ocr.image_utils import OCRToken, crop_image
-from worker.ocr.ocr_engine import OCRResult, run_ocr
+from worker.ocr.ocr_engine import OCRResult, run_ocr, get_paddle_device
 from worker.ocr.preprocessing import binarize_image
 
 
@@ -67,7 +67,13 @@ def _extract_table_cells(image) -> tuple[dict[str, str], int]:
         return {}, 0
 
     try:
-        table_engine = PPStructure(table=True, ocr=True, lang="japan", use_gpu=False, show_log=False)
+        table_engine = PPStructure(
+            table=True,
+            ocr=True,
+            lang="japan",
+            use_gpu=get_paddle_device().startswith("gpu"),
+            show_log=False,
+        )
         result = table_engine(image)
     except Exception:
         return {}, 0

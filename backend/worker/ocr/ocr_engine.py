@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import shutil
 from typing import List
 
@@ -10,6 +11,32 @@ import numpy as np
 from worker.ocr.image_utils import OCRToken, to_int_bbox
 
 _PADDLE_INSTANCE = None
+
+
+def get_paddle_device() -> str:
+    device = os.getenv("OCR_DEVICE")
+    if device:
+        return device
+
+    use_gpu_env = os.getenv("OCR_USE_GPU")
+    if use_gpu_env is not None:
+        return "gpu" if use_gpu_env.lower() in {"1", "true", "yes", "y"} else "cpu"
+
+    try:
+        import paddle
+    except Exception:
+        return "cpu"
+
+    try:
+        if paddle.device.is_compiled_with_cuda():
+            return "gpu"
+    except Exception:
+        return "cpu"
+    return "cpu"
+
+
+def _paddle_use_gpu() -> bool:
+    return get_paddle_device().startswith("gpu")
 
 
 @dataclass
@@ -61,7 +88,7 @@ def _run_paddle(image: np.ndarray, lang: str) -> OCRResult:
         _PADDLE_INSTANCE = PaddleOCR(
             use_angle_cls=True,
             lang="japan" if lang == "japan" else "en",
-            use_gpu=False,
+            use_gpu=_paddle_use_gpu(),
             show_log=False,
         )
 
