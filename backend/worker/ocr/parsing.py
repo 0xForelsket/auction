@@ -225,29 +225,105 @@ def parse_header_cells(cells: dict[str, str]) -> dict[str, ParsedField]:
 
 def parse_sheet(tokens: list[OCRToken]) -> dict[str, ParsedField]:
     results: dict[str, ParsedField] = {}
+    if not tokens:
+        return results
 
-    for token in tokens:
-        text_norm = normalize_text(token.text)
-        if "車台" in text_norm and token.text:
-            results["chassis"] = ParsedField(token.text, token.confidence, token.bbox, raw=token.text)
-            break
+    rows = group_tokens_by_row(tokens)
+    row_entries: list[dict[str, object]] = []
+    for row in rows:
+        row_sorted = sorted(row, key=lambda t: t.bbox[0])
+        row_text = " ".join([t.text for t in row_sorted if t.text])
+        row_entries.append(
+            {
+                "tokens": row_sorted,
+                "text": row_text,
+                "norm": normalize_text(row_text),
+                "bbox": _row_bbox(row_sorted),
+            }
+        )
 
-    if "chassis" not in results:
-        for token in tokens:
-            if re.match(r"[A-HJ-NPR-Z0-9]{8,17}", token.text or ""):
-                results["chassis"] = ParsedField(token.text, token.confidence, token.bbox, raw=token.text)
-                break
+    full_text = "\n".join([entry["text"] for entry in row_entries if entry["text"]])
 
-    for token in tokens:
-        text_norm = normalize_text(token.text)
-        if "km" in text_norm.lower() or "ｋｍ" in text_norm.lower():
-            results["mileage"] = ParsedField(token.text, token.confidence, token.bbox, raw=token.text)
-            break
+    chassis_field = _find_labeled_value(
+        row_entries,
+        [r"車台", r"車体", r"車台No", r"車台番号", r"車両No", r"車体番号"],
+        value_regex=r"[A-HJ-NPR-Z0-9-]{8,20}",
+    )
+    if not chassis_field:
+        chassis_field = _find_regex_field(
+            full_text, r"(?:車台|車体)[:\s]*([A-HJ-NPR-Z0-9-]{8,20})"
+        )
+    if not chassis_field:
+        chassis_field = _find_regex_field(full_text, r"\b([A-HJ-NPR-Z0-9-]{8,20})\b")
+    if chassis_field:
+        results["chassis"] = chassis_field
 
-    notes = [token.text for token in tokens if "注意" in token.text or "検査" in token.text]
-    if notes:
-        joined = " / ".join(notes)
-        results["notes"] = ParsedField(joined, 0.5, None, raw=joined)
+    mileage_field = _find_labeled_value(
+        row_entries,
+        [r"走行", r"走行距離", r"走行km", r"走行Ｋｍ", r"走行㎞"],
+        value_regex=r"\d[\d,]*(?:\.\d+)?",
+    )
+    if not mileage_field:
+        mileage_field = _find_regex_field(
+            full_text, r"走行[:\s]*([0-9,]+)\s*(?:km|㎞|ｋｍ|KM)?"
+        )
+    if mileage_field:
+        results["mileage"] = mileage_field
+
+    recycle_field = _find_regex_field(
+        full_text, r"リサイクル[:\s]*([0-9,]+)\s*円"
+    )
+    if recycle_field:
+        results["recycle_fee"] = recycle_field
+
+    inspector_field = _extract_block(
+        row_entries,
+        [r"検査員報告", r"検査報告", r"検査員コメント"],
+        stop_patterns=[
+            r"車台",
+            r"走行",
+            r"注意",
+            r"備考",
+            r"装備",
+            r"オプション",
+            r"リサイクル",
+        ],
+    )
+    if inspector_field:
+        results["inspector_report"] = inspector_field
+
+    notes_field = _extract_block(
+        row_entries,
+        [r"注意事項", r"注意", r"特記事項", r"備考"],
+        stop_patterns=[
+            r"車台",
+            r"走行",
+            r"検査員報告",
+            r"装備",
+            r"オプション",
+            r"リサイクル",
+        ],
+    )
+    if notes_field:
+        results["notes"] = notes_field
+
+    options_field = _extract_block(
+        row_entries,
+        [r"装備", r"オプション", r"OP", r"セールスポイント"],
+        stop_patterns=[r"車台", r"走行", r"注意", r"検査員報告", r"リサイクル"],
+    )
+    if options_field:
+        results["options"] = options_field
+
+    equipment_codes = parse_equipment(full_text)
+    if equipment_codes:
+        results["equipment_codes"] = ParsedField(
+            equipment_codes, 0.6, None, raw=equipment_codes
+        )
+
+    lane_field = _extract_lane_type(row_entries)
+    if lane_field:
+        results["lane_type"] = lane_field
 
     return results
 
@@ -347,6 +423,30 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
         data["chassis_no"] = sheet["chassis"].value
     if "notes" in sheet:
         data["notes_text"] = sheet["notes"].value
+    if "options" in sheet:
+        data["options_text"] = sheet["options"].value
+    if "lane_type" in sheet:
+        data["lane_type"] = sheet["lane_type"].value
+    if "equipment_codes" in sheet and not data.get("equipment_codes"):
+        data["equipment_codes"] = sheet["equipment_codes"].value
+
+    inspector_notes = {}
+    if "inspector_report" in sheet:
+        inspector_notes["inspector_report"] = sheet["inspector_report"].value
+    if "recycle_fee" in sheet:
+        inspector_notes["recycle_fee_yen"] = parse_yen(str(sheet["recycle_fee"].value))
+    if inspector_notes:
+        data["inspector_notes"] = inspector_notes
+
+    damage_text = " ".join(
+        [
+            str(sheet.get("notes").value) if "notes" in sheet else "",
+            str(sheet.get("inspector_report").value) if "inspector_report" in sheet else "",
+        ]
+    ).strip()
+    damage_codes = _extract_damage_codes(damage_text)
+    if damage_codes:
+        data["damage_locations"] = [{"code": code} for code in damage_codes]
 
     return data
 
@@ -408,3 +508,121 @@ def _parse_lot_venue_round(
 def _is_clean_round(value: object) -> bool:
     text = normalize_text(str(value))
     return bool(re.fullmatch(r"\d+回", text))
+
+
+def _extract_damage_codes(text: str) -> list[str]:
+    if not text:
+        return []
+    codes = re.findall(r"\b([A-Z]{1,2}\d)\b", text)
+    seen = []
+    for code in codes:
+        if code not in seen:
+            seen.append(code)
+    return seen
+
+
+def _row_bbox(tokens: list[OCRToken]) -> tuple[int, int, int, int] | None:
+    if not tokens:
+        return None
+    xs0 = [t.bbox[0] for t in tokens]
+    ys0 = [t.bbox[1] for t in tokens]
+    xs1 = [t.bbox[2] for t in tokens]
+    ys1 = [t.bbox[3] for t in tokens]
+    return (min(xs0), min(ys0), max(xs1), max(ys1))
+
+
+def _find_labeled_value(
+    rows: list[dict[str, object]],
+    patterns: list[str],
+    *,
+    value_regex: str | None = None,
+) -> ParsedField | None:
+    for idx, row in enumerate(rows):
+        row_tokens = row["tokens"]
+        for token_index, token in enumerate(row_tokens):
+            token_norm = normalize_text(token.text)
+            if any(re.search(pat, token_norm) for pat in patterns):
+                value_tokens = row_tokens[token_index + 1 :]
+                value_text = " ".join([t.text for t in value_tokens if t.text]).strip()
+                value_bbox = _row_bbox(value_tokens) if value_tokens else None
+                if not value_text and idx + 1 < len(rows):
+                    next_tokens = rows[idx + 1]["tokens"]
+                    value_text = " ".join([t.text for t in next_tokens if t.text]).strip()
+                    value_bbox = _row_bbox(next_tokens)
+                if value_regex and value_text:
+                    match = re.search(value_regex, value_text)
+                    if match:
+                        value_text = match.group(0)
+                if value_text:
+                    return ParsedField(
+                        value=value_text,
+                        confidence=token.confidence,
+                        bbox=value_bbox,
+                        raw=value_text,
+                    )
+    return None
+
+
+def _find_regex_field(text: str, pattern: str) -> ParsedField | None:
+    if not text:
+        return None
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    value = match.group(1) if match.lastindex else match.group(0)
+    return ParsedField(value=value, confidence=0.5, bbox=None, raw=value)
+
+
+def _extract_block(
+    rows: list[dict[str, object]],
+    patterns: list[str],
+    *,
+    stop_patterns: list[str],
+    max_rows: int = 6,
+) -> ParsedField | None:
+    for idx, row in enumerate(rows):
+        if any(re.search(pat, row["norm"]) for pat in patterns):
+            lines = []
+            bbox = row["bbox"]
+            row_text = row["text"]
+            if row_text:
+                for pat in patterns:
+                    row_text = re.sub(pat, "", row_text)
+                row_text = row_text.strip(" :：")
+                if row_text:
+                    lines.append(row_text)
+            for offset in range(1, max_rows + 1):
+                next_idx = idx + offset
+                if next_idx >= len(rows):
+                    break
+                next_row = rows[next_idx]
+                if any(re.search(pat, next_row["norm"]) for pat in stop_patterns):
+                    break
+                if next_row["text"]:
+                    lines.append(next_row["text"])
+                if bbox and next_row["bbox"]:
+                    bbox = (
+                        min(bbox[0], next_row["bbox"][0]),
+                        min(bbox[1], next_row["bbox"][1]),
+                        max(bbox[2], next_row["bbox"][2]),
+                        max(bbox[3], next_row["bbox"][3]),
+                    )
+            joined = " / ".join([line for line in lines if line])
+            if joined:
+                return ParsedField(value=joined, confidence=0.55, bbox=bbox, raw=joined)
+    return None
+
+
+def _extract_lane_type(rows: list[dict[str, object]]) -> ParsedField | None:
+    keywords = ["輸入車", "国産", "外車", "ディーラー", "業販", "評価点"]
+    if not rows:
+        return None
+    top_rows = rows[:3]
+    for row in top_rows:
+        text = row["text"]
+        if not text:
+            continue
+        for keyword in keywords:
+            if keyword in text:
+                return ParsedField(value=keyword, confidence=0.6, bbox=row["bbox"], raw=text)
+    return None

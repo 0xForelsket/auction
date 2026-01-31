@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import re
 
 from worker.ocr.image_utils import OCRToken, crop_image
 from worker.ocr.ocr_engine import OCRResult, run_ocr
+from worker.ocr.preprocessing import preprocess_auction_image, binarize_image
 from worker.ocr.vl_engine import run_vl_ocr
 
 
@@ -17,7 +19,8 @@ def extract_sheet(image, sheet_bbox) -> OCRResult:
     best_result = run_vl_ocr(crop)
     vl_tokens = best_result.tokens
 
-    if len(vl_tokens) < MIN_SHEET_TOKENS:
+    vl_low_signal = len(vl_tokens) >= MIN_SHEET_TOKENS and not _vl_has_value_signal(vl_tokens)
+    if len(vl_tokens) < MIN_SHEET_TOKENS or vl_low_signal:
         best_result, best_rotation, tesseract_used = _run_with_fallbacks(crop)
         if best_rotation:
             tokens = _map_tokens_from_rotated(
@@ -30,6 +33,7 @@ def extract_sheet(image, sheet_bbox) -> OCRResult:
                     "fallback": "line_ocr",
                     "vl_tokens": len(vl_tokens),
                     "vl_engine": "paddleocr-vl-1.5",
+                    "vl_low_signal": vl_low_signal,
                 }
             )
             best_result = OCRResult(
@@ -44,6 +48,7 @@ def extract_sheet(image, sheet_bbox) -> OCRResult:
                     "fallback": "line_ocr",
                     "vl_tokens": len(vl_tokens),
                     "vl_engine": "paddleocr-vl-1.5",
+                    "vl_low_signal": vl_low_signal,
                 }
             )
             if tesseract_used:
@@ -74,7 +79,10 @@ def _run_with_fallbacks(image: np.ndarray) -> tuple[OCRResult, int, bool]:
     best, best_rotation = _run_with_rotations(image)
     tesseract_used = False
     if len(best.tokens) < MIN_SHEET_TOKENS:
-        tesseract_result = run_ocr(image, lang="japan", engine_preference=["tesseract"])
+        tesseract_img = binarize_image(preprocess_auction_image(image))
+        tesseract_result = run_ocr(
+            tesseract_img, lang="japan", engine_preference=["tesseract"]
+        )
         if len(tesseract_result.tokens) > len(best.tokens):
             best = tesseract_result
             best_rotation = 0
@@ -83,14 +91,16 @@ def _run_with_fallbacks(image: np.ndarray) -> tuple[OCRResult, int, bool]:
 
 
 def _run_with_rotations(image: np.ndarray) -> tuple[OCRResult, int]:
-    best = run_ocr(image, lang="japan")
+    prepped = preprocess_auction_image(image)
+    best = run_ocr(prepped, lang="japan")
     best_rotation = 0
     if len(best.tokens) >= MIN_SHEET_TOKENS:
         return best, best_rotation
 
     for rotation in (90, 180, 270):
         rotated = _rotate_image(image, rotation)
-        result = run_ocr(rotated, lang="japan")
+        rotated_prepped = preprocess_auction_image(rotated)
+        result = run_ocr(rotated_prepped, lang="japan")
         if len(result.tokens) > len(best.tokens):
             best = result
             best_rotation = rotation
@@ -146,3 +156,21 @@ def _map_point_from_rotated(
     if rotation == 270:
         return (width - 1 - y, x)
     return (x, y)
+
+
+def _vl_has_value_signal(tokens: list[OCRToken]) -> bool:
+    if not tokens:
+        return False
+    value_like = 0
+    for token in tokens:
+        text = token.text or ""
+        if re.search(r"\d", text):
+            value_like += 1
+        elif re.search(r"[A-Z]{2,}", text):
+            value_like += 1
+        elif len(text) >= 6:
+            value_like += 1
+        if re.search(r"[A-HJ-NPR-Z0-9]{8,17}", text):
+            return True
+    threshold = max(3, int(len(tokens) * 0.1))
+    return value_like >= threshold
