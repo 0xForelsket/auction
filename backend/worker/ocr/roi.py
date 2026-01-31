@@ -26,6 +26,15 @@ def detect_rois(image: np.ndarray) -> RoiResult:
     sheet_bbox = (0, header_y1, left_width, height)
     photos_bbox = (left_width, header_y1, width, height)
 
+    if not _valid_header_bbox(header_bbox, width, height) or not _valid_sheet_bbox(
+        sheet_bbox, width, height
+    ):
+        header_bbox = fallback_header_bbox(width, height)
+        header_x0, header_y0, header_x1, header_y1 = header_bbox
+        left_width = int(width * 0.62)
+        sheet_bbox = (0, header_y1, left_width, height)
+        photos_bbox = (left_width, header_y1, width, height)
+
     return RoiResult(header_bbox=header_bbox, sheet_bbox=sheet_bbox, photos_bbox=photos_bbox)
 
 
@@ -76,3 +85,27 @@ def fallback_header_bbox(width: int, height: int) -> tuple[int, int, int, int]:
     header_height = int(height * 0.22)
     header_width = int(width * 0.62)
     return 0, 0, header_width, header_height
+
+
+def _valid_header_bbox(
+    bbox: tuple[int, int, int, int], width: int, height: int
+) -> bool:
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return False
+    if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+        return False
+    ratio = (y1 - y0) / max(height, 1)
+    return 0.06 <= ratio <= 0.25
+
+
+def _valid_sheet_bbox(
+    bbox: tuple[int, int, int, int], width: int, height: int
+) -> bool:
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return False
+    if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+        return False
+    ratio = (x1 - x0) / max(width, 1)
+    return 0.45 <= ratio <= 0.8

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     PASSWORD_HASH_SCHEME: str = "bcrypt"
 
     UPLOAD_MAX_SIZE_MB: int = 15
+    PIPELINE_VERSION: str = "v1"
 
     def resolved_sync_db_url(self) -> str:
         if self.DATABASE_URL_SYNC:

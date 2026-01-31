@@ -16,32 +16,38 @@ _PADDLE_INSTANCE = None
 class OCRResult:
     engine: str
     tokens: List[OCRToken]
+    meta: dict | None = None
 
 
-def run_ocr(image: np.ndarray, lang: str = "japan") -> OCRResult:
+def run_ocr(
+    image: np.ndarray,
+    lang: str = "japan",
+    engine_preference: list[str] | None = None,
+) -> OCRResult:
     """Run OCR using the best available engine.
 
     Priority:
     - PaddleOCR (if installed)
     - Tesseract (if pytesseract + binary available)
     """
-    result: OCRResult | None = None
-    try:
-        result = _run_paddle(image, lang=lang)
-        if result.tokens:
-            return result
-    except Exception:
-        result = None
+    order = engine_preference or ["paddle", "tesseract"]
+    last_result: OCRResult | None = None
+    for engine in order:
+        try:
+            if engine == "paddle":
+                result = _run_paddle(image, lang=lang)
+            elif engine == "tesseract":
+                result = _run_tesseract(image, lang=lang)
+            else:
+                continue
+            if result.tokens:
+                return result
+            if last_result is None:
+                last_result = result
+        except Exception:
+            continue
 
-    try:
-        tesseract_result = _run_tesseract(image, lang=lang)
-        if tesseract_result.tokens:
-            return tesseract_result
-        result = tesseract_result if result is None else result
-    except Exception:
-        pass
-
-    return result if result is not None else OCRResult(engine="none", tokens=[])
+    return last_result if last_result is not None else OCRResult(engine="none", tokens=[])
 
 
 def _run_paddle(image: np.ndarray, lang: str) -> OCRResult:
@@ -96,6 +102,7 @@ def result_to_json(result: OCRResult) -> str:
     return json.dumps(
         {
             "engine": result.engine,
+            "meta": result.meta,
             "tokens": [
                 {"text": token.text, "confidence": token.confidence, "bbox": list(token.bbox)}
                 for token in result.tokens

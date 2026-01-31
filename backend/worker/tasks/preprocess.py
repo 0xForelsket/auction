@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
 
 from worker.celery_app import celery_app
+from app.config import settings
 from app.db.session_sync import get_session
 from app.models.document import Document
 from app.services.storage import storage_client
 from worker.ocr import decode_image, detect_rois, encode_png, preprocess_auction_image
 
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(bind=True, max_retries=3, queue="cpu_preprocess", time_limit=120, soft_time_limit=90)
 def preprocess(self, document_id: str):
     with get_session() as session:
         doc = session.get(Document, document_id)
@@ -16,6 +17,7 @@ def preprocess(self, document_id: str):
 
         doc.status = "preprocessing"
         doc.processing_started_at = doc.processing_started_at or datetime.now(timezone.utc)
+        doc.pipeline_version = doc.pipeline_version or settings.PIPELINE_VERSION
         session.commit()
 
         try:

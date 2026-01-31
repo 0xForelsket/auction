@@ -25,6 +25,19 @@ services:
       - redis
       - minio
 
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    env_file: .env
+    environment:
+      PYTHONPATH: /app
+    command: ["celery", "-A", "worker.celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      - db
+      - redis
+      - minio
+
   frontend:
     build:
       context: ./frontend

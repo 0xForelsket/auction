@@ -29,7 +29,7 @@ LABEL_MAP = {
     "color": [r"色"],
     "model_code": [r"型式"],
     "result": [r"セリ結果"],
-    "bid_start": [r"応札額", r"スタート金額"],
+    "bid_start": [r"応札額", r"スタート金額", r"スタート", r"落札"],
     "score": [r"評価点"],
 }
 
@@ -131,11 +131,31 @@ def parse_mileage(text: str | None) -> tuple[int | None, int | None, str | None]
     return mileage_km, multiplier, raw
 
 
+def parse_mileage_header(text: str | None) -> tuple[int | None, int | None, float | None, str | None]:
+    if not text:
+        return None, None, 0.0, None
+    cleaned = normalize_text(text)
+    digits = re.sub(r"\D", "", cleaned)
+    if not digits:
+        return None, None, 0.0, text
+    if "," in cleaned or len(digits) >= 4:
+        return int(digits), 1, 0.95, text
+    try:
+        value = int(digits)
+    except ValueError:
+        return None, None, 0.0, text
+    if 0 <= value <= 300:
+        return value * 1000, 1000, 0.7, text
+    return value, 1, 0.3, text
+
+
 def parse_score(text: str | None) -> tuple[str | None, float | None]:
     if not text:
         return None, None
     cleaned = normalize_text(text)
-    if re.search(r"[Rr]", cleaned):
+    if "RA" in cleaned.upper():
+        return "RA", None
+    if "R" in cleaned.upper():
         return "R", None
     match = re.search(r"\d(?:\.\d)?", cleaned)
     if not match:
@@ -172,6 +192,17 @@ def parse_header(tokens: list[OCRToken]) -> dict[str, ParsedField]:
         if field:
             results[key] = field
 
+    return results
+
+
+def parse_header_cells(cells: dict[str, str]) -> dict[str, ParsedField]:
+    results: dict[str, ParsedField] = {}
+    for label, value in cells.items():
+        label_norm = normalize_text(label)
+        for key, patterns in LABEL_MAP.items():
+            if any(re.search(pat, label_norm) for pat in patterns):
+                results[key] = ParsedField(value=value, confidence=0.97, bbox=None, raw=value)
+                break
     return results
 
 
@@ -237,12 +268,14 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
     data["engine_cc"] = engine_cc
 
     mileage_text = _value(header, "mileage")
-    mileage_km, multiplier, mileage_raw = parse_mileage(mileage_text)
+    mileage_km, multiplier, mileage_conf, mileage_raw = parse_mileage_header(mileage_text)
     if mileage_km is None and "mileage" in sheet:
         mileage_km, multiplier, mileage_raw = parse_mileage(str(sheet["mileage"].value))
+        mileage_conf = None
     data["mileage_km"] = mileage_km
     data["mileage_multiplier"] = multiplier
     data["mileage_raw"] = mileage_raw
+    data["mileage_inference_conf"] = mileage_conf
 
     score_text = _value(header, "score")
     score, score_numeric = parse_score(score_text)
@@ -272,6 +305,38 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
         data["notes_text"] = sheet["notes"].value
 
     return data
+
+
+def merge_fields(
+    primary: dict[str, ParsedField], secondary: dict[str, ParsedField]
+) -> dict[str, ParsedField]:
+    merged: dict[str, ParsedField] = {}
+    keys = set(primary.keys()) | set(secondary.keys())
+    for key in keys:
+        first = primary.get(key)
+        second = secondary.get(key)
+        if first and second:
+            merged[key] = ParsedField(
+                value=first.value or second.value,
+                confidence=max(first.confidence, second.confidence),
+                bbox=second.bbox if _values_match(first.value, second.value) else first.bbox or second.bbox,
+                raw=first.raw or second.raw,
+            )
+        elif first:
+            merged[key] = first
+        elif second:
+            merged[key] = second
+    return merged
+
+
+def _values_match(left: str | int | float | None, right: str | int | float | None) -> bool:
+    if left is None or right is None:
+        return False
+    left_str = normalize_text(str(left))
+    right_str = normalize_text(str(right))
+    if not left_str or not right_str:
+        return False
+    return left_str in right_str or right_str in left_str
 
 
 def _value(fields: dict[str, ParsedField], key: str) -> str | None:

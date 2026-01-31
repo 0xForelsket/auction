@@ -34,3 +34,10 @@ def preprocess_auction_image(image: np.ndarray) -> np.ndarray:
     image = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
     return image
+
+
+def binarize_image(image: np.ndarray) -> np.ndarray:
+    """Binarize image for OCR fallback."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)

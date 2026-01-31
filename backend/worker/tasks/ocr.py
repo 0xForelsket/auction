@@ -7,7 +7,7 @@ from app.services.storage import storage_client
 from worker.ocr import decode_image, detect_rois, extract_header, extract_sheet
 
 
-@celery_app.task(bind=True, max_retries=2)
+@celery_app.task(bind=True, max_retries=2, queue="gpu_ocr", time_limit=480, soft_time_limit=420)
 def ocr(self, document_id: str):
     with get_session() as session:
         doc = session.get(Document, document_id)
@@ -33,22 +33,27 @@ def ocr(self, document_id: str):
 
             header_result = extract_header(image, header_bbox)
             sheet_result = extract_sheet(image, sheet_bbox)
+            doc.model_version = doc.model_version or header_result.primary.engine
 
             ocr_results = {
                 "header": {
-                    "engine": header_result.engine,
+                    "engine": header_result.primary.engine,
                     "tokens": [
                         {
                             "text": token.text,
                             "confidence": token.confidence,
                             "bbox": list(token.bbox),
                         }
-                        for token in header_result.tokens
+                        for token in header_result.primary.tokens
                     ],
                     "bbox": list(header_bbox),
+                    "table_cells": header_result.table_cells,
+                    "table_cell_count": header_result.table_cell_count,
+                    "method": header_result.method,
                 },
                 "sheet": {
                     "engine": sheet_result.engine,
+                    "meta": sheet_result.meta,
                     "tokens": [
                         {
                             "text": token.text,
@@ -60,6 +65,18 @@ def ocr(self, document_id: str):
                     "bbox": list(sheet_bbox),
                 },
             }
+            if header_result.fallback:
+                ocr_results["header"]["fallback"] = {
+                    "engine": header_result.fallback.engine,
+                    "tokens": [
+                        {
+                            "text": token.text,
+                            "confidence": token.confidence,
+                            "bbox": list(token.bbox),
+                        }
+                        for token in header_result.fallback.tokens
+                    ],
+                }
 
             key = f"ocr_raw/{document_id}.json"
             storage_client.upload_bytes(key, json.dumps(ocr_results).encode("utf-8"), "application/json")
