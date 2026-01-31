@@ -42,7 +42,7 @@ class Settings(BaseSettings):
         url = make_url(self.DATABASE_URL)
         if url.drivername.endswith("+asyncpg"):
             url = url.set(drivername=url.drivername.replace("+asyncpg", ""))
-        return str(url)
+        return url.render_as_string(hide_password=False)
 
 
 settings = Settings()

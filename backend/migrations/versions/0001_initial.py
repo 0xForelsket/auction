@@ -142,7 +142,8 @@ def upgrade() -> None:
                 "coalesce(chassis_no, '') || ' ' || "
                 "coalesce(notes_text, '') || ' ' || "
                 "coalesce(options_text, '') || ' ' || "
-                "coalesce(full_text, '')",
+                "coalesce(full_text, '')"
+                ")",
                 persisted=True,
             ),
         ),
