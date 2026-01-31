@@ -1,54 +1,21 @@
 from __future__ import annotations
 
-import os
 import cv2
 import numpy as np
 
 from worker.ocr.image_utils import OCRToken, crop_image
-from worker.ocr.ocr_engine import OCRResult, run_ocr, get_paddle_device
+from worker.ocr.ocr_engine import OCRResult, run_ocr
+from worker.ocr.vl_engine import run_vl_ocr
 
 
 MIN_SHEET_TOKENS = 10
-_VL_INSTANCE = None
-
-
-def _patch_paddle_tensor_int() -> None:
-    try:
-        import paddle
-    except Exception:
-        return
-
-    tensor_cls = getattr(paddle, "Tensor", None)
-    if tensor_cls is None:
-        return
-
-    current_int = getattr(tensor_cls, "__int__", None)
-    if current_int is None or getattr(current_int, "_auction_patch", False):
-        return
-
-    original_int = current_int
-
-    def _patched_int(self):
-        try:
-            return original_int(self)
-        except Exception:
-            try:
-                arr = self.numpy()
-            except Exception:
-                raise
-            if getattr(arr, "size", 0) == 1:
-                return int(arr.reshape(-1)[0])
-            raise
-
-    _patched_int._auction_patch = True
-    tensor_cls.__int__ = _patched_int
 
 
 def extract_sheet(image, sheet_bbox) -> OCRResult:
     crop = crop_image(image, sheet_bbox)
 
-    vl_tokens, vl_meta = _run_paddle_vl(crop)
-    best_result = OCRResult(engine="paddleocr-vl-1.5", tokens=vl_tokens, meta=vl_meta)
+    best_result = run_vl_ocr(crop)
+    vl_tokens = best_result.tokens
 
     if len(vl_tokens) < MIN_SHEET_TOKENS:
         best_result, best_rotation, tesseract_used = _run_with_fallbacks(crop)
@@ -179,94 +146,3 @@ def _map_point_from_rotated(
     if rotation == 270:
         return (width - 1 - y, x)
     return (x, y)
-
-
-def _run_paddle_vl(image: np.ndarray) -> tuple[list[OCRToken], dict]:
-    _patch_paddle_tensor_int()
-    vl = _get_vl_instance()
-    try:
-        predict_kwargs = {"use_queues": False}
-        max_new_tokens = os.getenv("PADDLEOCR_VL_MAX_NEW_TOKENS")
-        if max_new_tokens:
-            try:
-                predict_kwargs["max_new_tokens"] = int(max_new_tokens)
-            except ValueError:
-                pass
-        min_pixels = os.getenv("PADDLEOCR_VL_MIN_PIXELS")
-        if min_pixels:
-            try:
-                predict_kwargs["min_pixels"] = int(min_pixels)
-            except ValueError:
-                pass
-        max_pixels = os.getenv("PADDLEOCR_VL_MAX_PIXELS")
-        if max_pixels:
-            try:
-                predict_kwargs["max_pixels"] = int(max_pixels)
-            except ValueError:
-                pass
-        results = vl.predict([image], **predict_kwargs)
-    except Exception as exc:
-        return [], {"pipeline": "PaddleOCR-VL-1.5", "block_count": 0, "error": str(exc)}
-
-    if not results:
-        return [], {"pipeline": "PaddleOCR-VL-1.5", "block_count": 0}
-
-    result = results[0]
-    tokens = _tokens_from_vl_result(result)
-    return tokens, {"pipeline": "PaddleOCR-VL-1.5", "block_count": len(tokens)}
-
-
-def _get_vl_instance():
-    global _VL_INSTANCE
-    if _VL_INSTANCE is None:
-        try:
-            from paddleocr import PaddleOCRVL
-        except Exception as exc:  # pragma: no cover - required dependency
-            raise RuntimeError("PaddleOCRVL dependency missing") from exc
-        _VL_INSTANCE = PaddleOCRVL(
-            pipeline_version="v1.5",
-            device=get_paddle_device(),
-        )
-    return _VL_INSTANCE
-
-
-def _tokens_from_vl_result(result) -> list[OCRToken]:
-    blocks = result.get("parsing_res_list") or []
-    tokens: list[OCRToken] = []
-    for block in blocks:
-        if isinstance(block, dict):
-            label = block.get("block_label")
-            content = block.get("block_content")
-            bbox = block.get("block_bbox")
-            polygon = block.get("block_polygon_points")
-        else:
-            label = getattr(block, "label", None)
-            content = getattr(block, "content", None)
-            bbox = getattr(block, "bbox", None)
-            polygon = getattr(block, "polygon_points", None)
-
-        if label in {"image", "chart", "header_image", "footer_image"}:
-            continue
-        if not content:
-            continue
-        bbox_tuple = _coerce_bbox(bbox, polygon)
-        if bbox_tuple is None:
-            continue
-        for line in str(content).splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            tokens.append(OCRToken(text=line, confidence=0.85, bbox=bbox_tuple))
-    return tokens
-
-
-def _coerce_bbox(
-    bbox: list | tuple | None, polygon: list | tuple | None
-) -> tuple[int, int, int, int] | None:
-    if bbox and len(bbox) == 4:
-        return (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
-    if polygon:
-        xs = [int(p[0]) for p in polygon]
-        ys = [int(p[1]) for p in polygon]
-        return (min(xs), min(ys), max(xs), max(ys))
-    return None

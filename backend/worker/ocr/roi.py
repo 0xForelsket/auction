@@ -77,14 +77,12 @@ def detect_header_bbox(image: np.ndarray) -> tuple[int, int, int, int] | None:
     candidates.sort(key=lambda item: item[4], reverse=True)
     x0, y0, x1, y1, _ = candidates[0]
 
-    x1 = min(x1, int(width * 0.65))
     return int(x0), int(y0), int(x1), int(y1)
 
 
 def fallback_header_bbox(width: int, height: int) -> tuple[int, int, int, int]:
     header_height = int(height * 0.22)
-    header_width = int(width * 0.62)
-    return 0, 0, header_width, header_height
+    return 0, 0, width, header_height
 
 
 def _valid_header_bbox(
@@ -96,7 +94,14 @@ def _valid_header_bbox(
     if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
         return False
     ratio = (y1 - y0) / max(height, 1)
-    return 0.06 <= ratio <= 0.25
+    if not (0.06 <= ratio <= 0.25):
+        return False
+    width_ratio = (x1 - x0) / max(width, 1)
+    if width_ratio < 0.45 or width_ratio > 1.0:
+        return False
+    if x0 > width * 0.2:
+        return False
+    return True
 
 
 def _valid_sheet_bbox(

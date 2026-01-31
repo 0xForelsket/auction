@@ -86,21 +86,51 @@ def _run_paddle(image: np.ndarray, lang: str) -> OCRResult:
 
     if _PADDLE_INSTANCE is None:
         _PADDLE_INSTANCE = PaddleOCR(
-            use_angle_cls=True,
+            use_textline_orientation=True,
             lang="japan" if lang == "japan" else "en",
-            use_gpu=_paddle_use_gpu(),
-            show_log=False,
+            ocr_version="PP-OCRv3",
+            device=get_paddle_device(),
         )
 
-    results = _PADDLE_INSTANCE.ocr(image, cls=True)
+    results = _PADDLE_INSTANCE.predict([image])
+    if not results:
+        return OCRResult(engine="paddle", tokens=[])
+
+    result = results[0]
+    if hasattr(result, "get"):
+        texts = result.get("rec_texts") or []
+        scores = result.get("rec_scores") or []
+        polys = result.get("rec_polys") or result.get("rec_boxes") or []
+    else:
+        texts = getattr(result, "rec_texts", None) or []
+        scores = getattr(result, "rec_scores", None) or []
+        polys = getattr(result, "rec_polys", None) or getattr(result, "rec_boxes", None) or []
 
     tokens: list[OCRToken] = []
-    for line in results or []:
-        for box, (text, confidence) in line:
-            bbox = to_int_bbox(box)
-            tokens.append(OCRToken(text=text, confidence=float(confidence), bbox=bbox))
+    for text, confidence, poly in zip(texts, scores, polys):
+        text = (text or "").strip()
+        if not text:
+            continue
+        bbox = _bbox_from_poly(poly)
+        if bbox is None:
+            continue
+        tokens.append(OCRToken(text=text, confidence=float(confidence), bbox=bbox))
 
     return OCRResult(engine="paddle", tokens=tokens)
+
+
+def _bbox_from_poly(poly) -> tuple[int, int, int, int] | None:
+    if poly is None:
+        return None
+    try:
+        arr = np.array(poly)
+    except Exception:
+        return None
+    if arr.ndim == 1 and arr.shape[0] == 4:
+        return (int(arr[0]), int(arr[1]), int(arr[2]), int(arr[3]))
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return to_int_bbox(arr)
+    return None
 
 
 def _run_tesseract(image: np.ndarray, lang: str) -> OCRResult:

@@ -5,7 +5,8 @@ import html as html_lib
 import re
 
 from worker.ocr.image_utils import OCRToken, crop_image
-from worker.ocr.ocr_engine import OCRResult, run_ocr, get_paddle_device
+from worker.ocr.ocr_engine import OCRResult, run_ocr
+from worker.ocr.vl_engine import run_vl_ocr
 from worker.ocr.preprocessing import binarize_image
 
 
@@ -21,14 +22,25 @@ class HeaderExtraction:
 def extract_header(image, header_bbox) -> HeaderExtraction:
     crop = crop_image(image, header_bbox)
 
-    table_cells, table_cell_count = _extract_table_cells(crop)
-    method = "ppstructure" if table_cells else "line"
-
-    primary = run_ocr(crop, lang="japan", engine_preference=["paddle", "tesseract"])
+    primary = run_vl_ocr(crop)
+    table_cells = {}
+    table_cell_count = 0
+    method = "vl"
+    if primary.meta:
+        table_cells = primary.meta.get("table_cells") or {}
+        table_cell_count = int(primary.meta.get("table_cell_count") or 0)
+    if not table_cells:
+        table_cells, table_cell_count = _extract_table_cells(crop)
+        if table_cells:
+            method = "ppstructure"
     fallback = None
-    if primary.engine != "tesseract":
+    if not primary.tokens:
         try:
-            fallback = run_ocr(binarize_image(crop), lang="japan", engine_preference=["tesseract"])
+            fallback = run_ocr(
+                binarize_image(crop),
+                lang="japan",
+                engine_preference=["paddle", "tesseract"],
+            )
         except Exception:
             fallback = None
 
@@ -61,37 +73,8 @@ def _offset_result(result: OCRResult, header_bbox) -> OCRResult:
 
 
 def _extract_table_cells(image) -> tuple[dict[str, str], int]:
-    try:
-        from paddleocr import PPStructure
-    except Exception:
-        return {}, 0
-
-    try:
-        table_engine = PPStructure(
-            table=True,
-            ocr=True,
-            lang="japan",
-            use_gpu=get_paddle_device().startswith("gpu"),
-            show_log=False,
-        )
-        result = table_engine(image)
-    except Exception:
-        return {}, 0
-
-    html_table = None
-    for item in result or []:
-        if isinstance(item, dict):
-            res = item.get("res") or {}
-            html_table = res.get("html") or item.get("html")
-            if html_table:
-                break
-
-    if not html_table:
-        return {}, 0
-
-    rows = _parse_table_html(html_table)
-    cells, cell_count = _cells_from_rows(rows)
-    return cells, cell_count
+    # Disabled by default: PPStructureV3 is heavyweight and not required for VL-first OCR.
+    return {}, 0
 
 
 def _parse_table_html(html_text: str) -> list[list[str]]:

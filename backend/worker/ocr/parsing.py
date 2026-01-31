@@ -218,8 +218,8 @@ def parse_header_cells(cells: dict[str, str]) -> dict[str, ParsedField]:
         label_norm = normalize_text(label)
         for key, patterns in LABEL_MAP.items():
             if any(re.search(pat, label_norm) for pat in patterns):
-                results[key] = ParsedField(value=value, confidence=0.97, bbox=None, raw=value)
-                break
+                if key not in results:
+                    results[key] = ParsedField(value=value, confidence=0.97, bbox=None, raw=value)
     return results
 
 
@@ -270,7 +270,23 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
     venue_round = _value(header, "auction_venue_round")
     if venue_round:
         data["auction_venue_round"] = venue_round
-    data["lot_no"] = _value(header, "lot_no")
+
+    lot_raw = _value(header, "lot_no")
+    data["lot_no"] = lot_raw
+
+    lot_guess, venue_guess, round_guess = _parse_lot_venue_round(
+        lot_raw or venue_raw or venue_round
+    )
+    if lot_guess and (not lot_raw or not lot_raw.strip().isdigit()):
+        data["lot_no"] = lot_guess
+    if venue_guess:
+        current_venue = data.get("auction_venue")
+        if not current_venue or any(ch.isdigit() for ch in str(current_venue)):
+            data["auction_venue"] = venue_guess
+    if round_guess:
+        current_round = data.get("auction_venue_round")
+        if not current_round or not _is_clean_round(current_round):
+            data["auction_venue_round"] = round_guess
 
     make_model = _value(header, "make_model")
     data["make_model"] = make_model
@@ -370,3 +386,25 @@ def _values_match(left: str | int | float | None, right: str | int | float | Non
 def _value(fields: dict[str, ParsedField], key: str) -> str | None:
     field = fields.get(key)
     return field.value if field else None
+
+
+def _parse_lot_venue_round(
+    text: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    if not text:
+        return None, None, None
+    cleaned = normalize_text(text)
+    match = re.match(r"(?P<lot>\d{3,8})?(?P<venue>[^\d]+)?(?P<round>\d+回)?", cleaned)
+    if not match:
+        return None, None, None
+    lot = match.group("lot")
+    venue = match.group("venue") or None
+    round_val = match.group("round")
+    if venue:
+        venue = venue.replace("会場", "").replace("開催回", "").strip() or None
+    return lot, venue, round_val
+
+
+def _is_clean_round(value: object) -> bool:
+    text = normalize_text(str(value))
+    return bool(re.fullmatch(r"\d+回", text))
