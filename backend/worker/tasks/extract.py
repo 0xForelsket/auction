@@ -21,8 +21,8 @@ from worker.ocr.parsing import (
 
 
 P0_FIELDS = {"lot_no", "auction_date", "auction_venue", "score", "final_bid_yen"}
-P0_FIELD_CONF_MAP = {"final_bid_yen": "bid_start"}
-P0_HEADER_KEYS = {"lot_no", "auction_date", "auction_venue", "score", "bid_start"}
+P0_FIELD_CONF_MAP = {"final_bid_yen": "final_bid"}
+P0_HEADER_KEYS = {"lot_no", "auction_date", "auction_venue", "score"}
 
 
 @celery_app.task(bind=True, max_retries=2, queue="extract", time_limit=120, soft_time_limit=90)
@@ -155,8 +155,15 @@ def evaluate_review_policy(
 
     low_conf = []
     for field in P0_FIELDS:
-        header_key = P0_FIELD_CONF_MAP.get(field, field)
-        if _field_confidence(evidence, header_key) < 0.9:
+        if field == "final_bid_yen":
+            conf = max(
+                _field_confidence(evidence, "final_bid"),
+                _field_confidence(evidence, "bid_start"),
+            )
+        else:
+            header_key = P0_FIELD_CONF_MAP.get(field, field)
+            conf = _field_confidence(evidence, header_key)
+        if conf < 0.9:
             low_conf.append(field)
     if low_conf:
         return True, f"Low confidence P0 fields: {', '.join(low_conf)}"
@@ -197,7 +204,14 @@ def build_evidence(document_id: str, image, header_fields: dict, sheet_fields: d
 
 
 def _missing_p0(fields: dict[str, object]) -> bool:
-    return any(key not in fields or not getattr(fields[key], "value", None) for key in P0_HEADER_KEYS)
+    if any(key not in fields or not getattr(fields[key], "value", None) for key in P0_HEADER_KEYS):
+        return True
+    has_bid = False
+    for key in ("final_bid", "bid_start"):
+        if key in fields and getattr(fields[key], "value", None):
+            has_bid = True
+            break
+    return not has_bid
 
 
 def _field_confidence(evidence: dict, field: str) -> float:

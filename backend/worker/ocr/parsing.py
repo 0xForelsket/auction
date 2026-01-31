@@ -20,8 +20,10 @@ class ParsedField:
 LABEL_MAP = {
     "auction_date": [r"開催日"],
     "auction_venue": [r"会場"],
+    "auction_venue_round": [r"開催回"],
     "lot_no": [r"出品番号"],
     "make_model": [r"車種名", r"車種名/グレード"],
+    "grade": [r"グレード"],
     "model_year": [r"年式"],
     "shift_engine": [r"シフト/排気量"],
     "mileage": [r"走行"],
@@ -29,7 +31,9 @@ LABEL_MAP = {
     "color": [r"色"],
     "model_code": [r"型式"],
     "result": [r"セリ結果"],
-    "bid_start": [r"応札額", r"スタート金額", r"スタート", r"落札"],
+    "starting_bid": [r"応札額", r"スタート金額", r"スタート"],
+    "final_bid": [r"落札"],
+    "bid_start": [r"応札額", r"スタート金額"],
     "score": [r"評価点"],
 }
 
@@ -113,6 +117,19 @@ def parse_price_pair(text: str | None) -> tuple[int | None, int | None]:
     if start is not None and start < 100000:
         start *= 10000
     return final, start
+
+
+def parse_yen(text: str | None) -> int | None:
+    if not text:
+        return None
+    cleaned = normalize_text(text)
+    numbers = re.findall(r"\d+(?:,\d{3})*", cleaned)
+    if not numbers:
+        return None
+    value = int(numbers[0].replace(",", ""))
+    if value < 100000:
+        value *= 10000
+    return value
 
 
 def parse_mileage(text: str | None) -> tuple[int | None, int | None, str | None]:
@@ -250,10 +267,14 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
             data["auction_venue"] = venue_raw
     else:
         data["auction_venue"] = None
+    venue_round = _value(header, "auction_venue_round")
+    if venue_round:
+        data["auction_venue_round"] = venue_round
     data["lot_no"] = _value(header, "lot_no")
 
     make_model = _value(header, "make_model")
     data["make_model"] = make_model
+    data["grade"] = _value(header, "grade")
 
     model_year_text = _value(header, "model_year")
     data["model_year_reiwa"] = model_year_text
@@ -293,7 +314,14 @@ def build_record_fields(header: dict[str, ParsedField], sheet: dict[str, ParsedF
     else:
         data["result"] = result_text
 
-    final_bid, starting_bid = parse_price_pair(_value(header, "bid_start"))
+    final_bid = parse_yen(_value(header, "final_bid"))
+    starting_bid = parse_yen(_value(header, "starting_bid"))
+    if final_bid is None or starting_bid is None:
+        final_pair, start_pair = parse_price_pair(_value(header, "bid_start"))
+        if final_bid is None:
+            final_bid = final_pair
+        if starting_bid is None:
+            starting_bid = start_pair
     data["final_bid_yen"] = final_bid
     data["starting_bid_yen"] = starting_bid
 

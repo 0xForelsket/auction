@@ -67,7 +67,7 @@ def _extract_table_cells(image) -> tuple[dict[str, str], int]:
         return {}, 0
 
     try:
-        table_engine = PPStructure(table=True, ocr=True, lang="japan")
+        table_engine = PPStructure(table=True, ocr=True, lang="japan", use_gpu=False, show_log=False)
         result = table_engine(image)
     except Exception:
         return {}, 0

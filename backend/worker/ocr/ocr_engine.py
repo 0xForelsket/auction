@@ -58,7 +58,12 @@ def _run_paddle(image: np.ndarray, lang: str) -> OCRResult:
         raise RuntimeError("PaddleOCR not installed") from exc
 
     if _PADDLE_INSTANCE is None:
-        _PADDLE_INSTANCE = PaddleOCR(use_angle_cls=True, lang="japan" if lang == "japan" else "en")
+        _PADDLE_INSTANCE = PaddleOCR(
+            use_angle_cls=True,
+            lang="japan" if lang == "japan" else "en",
+            use_gpu=False,
+            show_log=False,
+        )
 
     results = _PADDLE_INSTANCE.ocr(image, cls=True)
 
