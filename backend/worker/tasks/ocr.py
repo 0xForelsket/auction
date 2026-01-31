@@ -4,6 +4,7 @@ from worker.celery_app import celery_app
 from app.db.session_sync import get_session
 from app.models.document import Document
 from app.services.storage import storage_client
+from worker.ocr import decode_image, detect_rois, extract_header, extract_sheet
 
 
 @celery_app.task(bind=True, max_retries=2)
@@ -17,7 +18,49 @@ def ocr(self, document_id: str):
         session.commit()
 
         try:
-            ocr_results = {"header": {}, "sheet": {}, "note": "OCR not configured"}
+            if not doc.preprocessed_path:
+                raise ValueError("Missing preprocessed_path")
+            image_bytes = storage_client.download_bytes(doc.preprocessed_path)
+            image = decode_image(image_bytes)
+
+            if not doc.roi:
+                rois = detect_rois(image)
+                header_bbox = rois.header_bbox
+                sheet_bbox = rois.sheet_bbox
+            else:
+                header_bbox = tuple(doc.roi.get("header_bbox"))
+                sheet_bbox = tuple(doc.roi.get("sheet_bbox"))
+
+            header_result = extract_header(image, header_bbox)
+            sheet_result = extract_sheet(image, sheet_bbox)
+
+            ocr_results = {
+                "header": {
+                    "engine": header_result.engine,
+                    "tokens": [
+                        {
+                            "text": token.text,
+                            "confidence": token.confidence,
+                            "bbox": list(token.bbox),
+                        }
+                        for token in header_result.tokens
+                    ],
+                    "bbox": list(header_bbox),
+                },
+                "sheet": {
+                    "engine": sheet_result.engine,
+                    "tokens": [
+                        {
+                            "text": token.text,
+                            "confidence": token.confidence,
+                            "bbox": list(token.bbox),
+                        }
+                        for token in sheet_result.tokens
+                    ],
+                    "bbox": list(sheet_bbox),
+                },
+            }
+
             key = f"ocr_raw/{document_id}.json"
             storage_client.upload_bytes(key, json.dumps(ocr_results).encode("utf-8"), "application/json")
         except Exception as exc:

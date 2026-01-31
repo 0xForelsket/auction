@@ -1,10 +1,10 @@
 from datetime import datetime, timezone
-from pathlib import Path
 
 from worker.celery_app import celery_app
 from app.db.session_sync import get_session
 from app.models.document import Document
 from app.services.storage import storage_client
+from worker.ocr import decode_image, detect_rois, encode_png, preprocess_auction_image
 
 
 @celery_app.task(bind=True, max_retries=3)
@@ -22,10 +22,22 @@ def preprocess(self, document_id: str):
             source_key = doc.original_path
             if not source_key:
                 raise ValueError("Missing original_path")
-            ext = Path(source_key).suffix or ".jpg"
-            dest_key = f"preprocessed/{doc.id}{ext}"
-            storage_client.copy_object(source_key, dest_key)
-            doc.preprocessed_path = dest_key
+
+            image_bytes = storage_client.download_bytes(source_key)
+            image = decode_image(image_bytes)
+            processed = preprocess_auction_image(image)
+
+            rois = detect_rois(processed)
+            doc.roi = {
+                "header_bbox": list(rois.header_bbox),
+                "sheet_bbox": list(rois.sheet_bbox),
+                "photos_bbox": list(rois.photos_bbox) if rois.photos_bbox else None,
+                "roi_version": rois.roi_version,
+            }
+
+            preprocessed_key = f"preprocessed/{doc.id}.png"
+            storage_client.upload_bytes(preprocessed_key, encode_png(processed), "image/png")
+            doc.preprocessed_path = preprocessed_key
             doc.status = "ocr"
             session.commit()
         except Exception as exc:
