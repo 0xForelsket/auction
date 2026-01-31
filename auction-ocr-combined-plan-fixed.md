@@ -317,28 +317,28 @@ CREATE TRIGGER trg_documents_updated_at
 BEFORE UPDATE ON documents
 FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
-    -- Auction records table (extracted data)
-    CREATE TABLE auction_records (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-        
-        -- Core fields (typed for filtering)
-        auction_date DATE,
-        auction_venue VARCHAR(255),
-        auction_venue_round VARCHAR(50),       -- e.g., "1488回"
-        lot_no VARCHAR(100),
-        
-        -- Vehicle info
-        make VARCHAR(100),
-        model VARCHAR(255),
-        make_model VARCHAR(255),  -- Combined for easier search
-        grade VARCHAR(100),
-        model_code VARCHAR(100),               -- 型式 (e.g., "TALA15", "J1NE")
-        chassis_no VARCHAR(100),               -- 車台No / VIN (often from the sheet)
-        year INTEGER,
+-- Auction records table (extracted data)
+CREATE TABLE auction_records (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     
+    -- Core fields (typed for filtering)
+    auction_date DATE,
+    auction_venue VARCHAR(255),
+    auction_venue_round VARCHAR(50),       -- e.g., "1488回"
+    lot_no VARCHAR(100),
+    
+    -- Vehicle info
+    make VARCHAR(100),
+    model VARCHAR(255),
+    make_model VARCHAR(255),               -- combined for easier search
+    grade VARCHAR(100),
+    model_code VARCHAR(100),               -- 型式 (e.g., "TALA15", "J1NE")
+    chassis_no VARCHAR(100),               -- 車台No / VIN (often from the sheet)
+    year INTEGER,
+
     -- Japanese era year (for reference)
-    model_year_reiwa VARCHAR(10),         -- 'R05'
+    model_year_reiwa VARCHAR(10),          -- 'R05'
     model_year_gregorian INTEGER,          -- 2023
     
     -- Inspection expiry (often provided as year-month, e.g. R08.09)
@@ -348,20 +348,19 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
     -- Engine/transmission
     engine_cc INTEGER,                     -- 2000, 2400, 2500
     transmission VARCHAR(20),              -- AT, FA, CA, CVT
+
     -- Condition
     mileage_km INTEGER,
+    mileage_raw TEXT,                      -- raw token as seen (e.g., "8" or "8.1" or "81,000")
+    mileage_multiplier INTEGER,            -- 1 or 1000
+    mileage_inference_conf DECIMAL(3,2),   -- 0.00..1.00
 
-    -- Mileage transparency (header may be abbreviated; keep inference metadata)
-    mileage_raw TEXT,                       -- raw token as seen (e.g., "8" or "8.1" or "81,000")
-    mileage_multiplier INTEGER,             -- 1 or 1000
-    mileage_inference_conf DECIMAL(3,2),    -- 0.00..1.00
-
-    score VARCHAR(20),                      -- "4.5", "R", "***", etc.
-    score_numeric DECIMAL(3,1),             -- parsed numeric for filtering
+    score VARCHAR(20),                     -- "4.5", "R", "***", etc.
+    score_numeric DECIMAL(3,1),            -- parsed numeric for filtering
     color VARCHAR(100),
 
     -- Auction result (canonical in JPY)
-    result VARCHAR(50),                     -- sold, unsold, negotiating
+    result VARCHAR(50),                    -- sold, unsold, negotiating
     starting_bid_yen INTEGER,
     final_bid_yen INTEGER,
 
@@ -370,7 +369,6 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
     final_bid_man INTEGER GENERATED ALWAYS AS (final_bid_yen / 10000) STORED,
 
     -- USS-specific
-
     lane_type VARCHAR(50),                 -- プライムコーナー, Aコーナー, etc.
     equipment_codes TEXT,                  -- AAC, ナビ, SR, AW, 革, PS, PW
     
@@ -387,10 +385,10 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
     -- Raw text
     notes_text TEXT,
     options_text TEXT,
-    full_text TEXT,  -- All OCR text concatenated
+    full_text TEXT,                        -- all OCR text concatenated (not indexed via pg_trgm)
     
     -- Extraction evidence (JSONB for flexibility)
-    -- Structure: {"field_name": {"value": "...", "confidence": 0.95, "bbox": [x,y,w,h], "crop_path": "...", "source": "header|sheet"}}
+    -- {"field_name": {"value": "...", "confidence": 0.95, "bbox": [x,y,w,h], "crop_path": "...", "source": "header|sheet"}}
     evidence JSONB DEFAULT '{}',
     
     -- Review status
@@ -406,22 +404,23 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
     -- Search support
     -- Postgres built-in FTS doesn't segment Japanese well, so use:
     -- - fts_vector_en: English/Latin FTS + ranking
-    -- - search_text: JP/EN substring + fuzzy matching (ILIKE / similarity) via pg_trgm
-        fts_vector_en tsvector GENERATED ALWAYS AS (
-        to_tsvector('english',
-        COALESCE(lot_no, '') || ' ' ||
-        COALESCE(auction_venue, '') || ' ' ||
-        COALESCE(auction_venue_round, '') || ' ' ||
-        COALESCE(make_model, '') || ' ' ||
-        COALESCE(model_code, '') || ' ' ||
-        COALESCE(chassis_no, '') || ' ' ||
-        COALESCE(notes_text, '') || ' ' ||
-        COALESCE(options_text, '') || ' ' ||
-        COALESCE(full_text, '')
+    -- - search_text: JP/EN substring + fuzzy matching via pg_trgm (keep it small!)
+    fts_vector_en tsvector GENERATED ALWAYS AS (
+        to_tsvector(
+            'english',
+            COALESCE(lot_no, '') || ' ' ||
+            COALESCE(auction_venue, '') || ' ' ||
+            COALESCE(auction_venue_round, '') || ' ' ||
+            COALESCE(make_model, '') || ' ' ||
+            COALESCE(model_code, '') || ' ' ||
+            COALESCE(chassis_no, '') || ' ' ||
+            COALESCE(notes_text, '') || ' ' ||
+            COALESCE(options_text, '') || ' ' ||
+            COALESCE(full_text, '')
         )
-        ) STORED,
+    ) STORED,
 
-        search_text TEXT GENERATED ALWAYS AS (
+    search_text TEXT GENERATED ALWAYS AS (
         COALESCE(lot_no, '') || ' ' ||
         COALESCE(auction_venue, '') || ' ' ||
         COALESCE(auction_venue_round, '') || ' ' ||
@@ -433,34 +432,33 @@ FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
         COALESCE(model_code, '') || ' ' ||
         COALESCE(chassis_no, '') || ' ' ||
         COALESCE(notes_text, '') || ' ' ||
-        COALESCE(options_text, '') || ' ' ||
-        COALESCE(full_text, '')
-        ) STORED,
+        COALESCE(options_text, '')
+    ) STORED,
     
     -- Timestamps
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-    -- Indexes for common queries
-    CREATE INDEX idx_records_document ON auction_records(document_id);
-    CREATE INDEX idx_records_auction_date ON auction_records(auction_date DESC);
-    CREATE INDEX idx_records_auction_venue ON auction_records(auction_venue);
-    CREATE INDEX idx_records_lot ON auction_records(lot_no);
-    CREATE INDEX idx_records_make_model ON auction_records(make_model);
-    CREATE INDEX idx_records_model_code ON auction_records(model_code);
-    CREATE INDEX idx_records_chassis_no ON auction_records(chassis_no);
-    CREATE INDEX idx_records_mileage ON auction_records(mileage_km);
-    CREATE INDEX idx_records_score ON auction_records(score_numeric);
-    CREATE INDEX idx_records_price ON auction_records(final_bid_yen);
-    CREATE INDEX idx_records_needs_review ON auction_records(needs_review) WHERE needs_review = true;
-    CREATE INDEX idx_records_fts_en ON auction_records USING GIN(fts_vector_en);
+-- Indexes for common queries
+CREATE INDEX idx_records_document ON auction_records(document_id);
+CREATE INDEX idx_records_auction_date ON auction_records(auction_date DESC);
+CREATE INDEX idx_records_auction_venue ON auction_records(auction_venue);
+CREATE INDEX idx_records_lot ON auction_records(lot_no);
+CREATE INDEX idx_records_make_model ON auction_records(make_model);
+CREATE INDEX idx_records_model_code ON auction_records(model_code);
+CREATE INDEX idx_records_chassis_no ON auction_records(chassis_no);
+CREATE INDEX idx_records_mileage ON auction_records(mileage_km);
+CREATE INDEX idx_records_score ON auction_records(score_numeric);
+CREATE INDEX idx_records_price ON auction_records(final_bid_yen);
+CREATE INDEX idx_records_needs_review ON auction_records(needs_review) WHERE needs_review = true;
+CREATE INDEX idx_records_fts_en ON auction_records USING GIN(fts_vector_en);
 
-    -- Trigram indexes for fuzzy search
-    CREATE INDEX idx_records_make_model_trgm ON auction_records USING GIN(make_model gin_trgm_ops);
-    CREATE INDEX idx_records_model_code_trgm ON auction_records USING GIN(model_code gin_trgm_ops);
-    CREATE INDEX idx_records_chassis_no_trgm ON auction_records USING GIN(chassis_no gin_trgm_ops);
-    CREATE INDEX idx_records_search_text_trgm ON auction_records USING GIN(search_text gin_trgm_ops);
+-- Trigram indexes for fuzzy search (JP/EN substring matches)
+CREATE INDEX idx_records_make_model_trgm ON auction_records USING GIN(make_model gin_trgm_ops);
+CREATE INDEX idx_records_model_code_trgm ON auction_records USING GIN(model_code gin_trgm_ops);
+CREATE INDEX idx_records_chassis_no_trgm ON auction_records USING GIN(chassis_no gin_trgm_ops);
+CREATE INDEX idx_records_search_text_trgm ON auction_records USING GIN(search_text gin_trgm_ops);
 
 -- GIN index on evidence JSONB
 CREATE INDEX idx_records_evidence ON auction_records USING GIN(evidence);
@@ -754,6 +752,82 @@ def ocr(self, document_id):
         raise self.retry(exc=e, countdown=120)
 ```
 
+#### 5.4 Fallback & Degraded Mode Policy (Explicit Rules)
+
+The goal is: **always produce a deterministic record + evidence**, and only auto-pass when P0/P1 are both **present** and **validated**.
+
+**Baseline definitions**
+- **P0 fields (auto-pass gating):** `lot_no`, `auction_date`, `auction_venue`, `score`, `final_bid_yen`
+- **Header success:** all P0 parse cleanly and `confidence >= 0.90` per field
+- **Header failure:** missing/invalid P0 OR table parser returns too few cells (e.g., `< 8`) OR OCR returns empty
+
+**Header OCR fallback ladder**
+1. **Primary:** `PPStructure(table=True)` on `header_bbox`
+2. **Fallback A (same engine, no table):** run `PaddleOCR` on `header_bbox` and parse using label anchors + regex
+3. **Fallback B (alternate engine):** run `Tesseract (jpn+eng)` on a binarized header crop and parse via regex
+4. **If still missing P0:** `needs_review = true` with reason `Missing P0 from header after fallbacks`
+
+**Sheet OCR fallback ladder (supplementary only)**
+1. **Primary:** `PaddleOCR` on `sheet_bbox`
+2. **Rotation retry:** if result has too few lines (e.g., `< 10`), try rotations (90/180/270) and pick best by box count
+3. **Fallback:** `Tesseract (jpn+eng)` for chassis/mileage heuristics
+4. If still empty: keep `full_text` empty and rely on header; do not fail the whole document solely due to sheet OCR
+
+**GPU unavailable / OOM**
+- Route OCR tasks to a CPU queue and reduce concurrency (`worker_prefetch_multiplier = 1`)
+- If GPU OOM on a specific image: retry once with a smaller upscale cap (e.g., 1200px height), then CPU fallback
+
+**Decision table**
+
+| Condition | Action | Result |
+|----------|--------|--------|
+| Header P0 extracted + validated | Accept header output | Eligible for auto-pass |
+| PPStructure fails / missing P0 | Run PaddleOCR line OCR + regex parse | Try to recover P0 |
+| Still missing P0 | Run Tesseract header + regex parse | Last attempt |
+| Still missing P0 | Mark `needs_review` | Human correction required |
+| Sheet OCR empty | Keep record, set sheet fields empty | Do not block auto-pass |
+| Mileage inferred from header only | Require sheet confirmation OR flag review | Prevent silent unit mistakes |
+
+**Ensemble merge rule (if multiple engines produce candidates)**
+- For each field, pick the candidate that:
+  1) passes validation regex/range checks, then
+  2) has highest confidence (or engine priority if confidence not comparable), then
+  3) matches other fields (e.g., mileage consistency header vs sheet)
+
+
+#### 5.5 Failure Modes & Recovery (Runbooks)
+
+**Stuck job detection**
+- Add a watchdog job (Celery beat / cron) every 1–5 minutes:
+  - If `status IN ('preprocessing','ocr','extracting')` and `processing_started_at` is older than a threshold, mark `needs_review` or requeue.
+  - Suggested thresholds at your scale:
+    - preprocessing: 2 minutes
+    - ocr: 8 minutes
+    - extracting: 2 minutes
+
+**Celery reliability defaults (recommended)**
+- `task_acks_late = True` (avoid losing work on worker crash)
+- `task_reject_on_worker_lost = True`
+- `worker_prefetch_multiplier = 1` (prevents one worker from hoarding tasks)
+- `task_time_limit` + `task_soft_time_limit` per stage (enforces stuck detection)
+- Separate queues: `cpu_preprocess`, `gpu_ocr`, `cpu_ocr`, `extract`
+
+**Dead letter policy**
+- After max retries, do **not** keep retrying forever:
+  - mark document `status='failed'`, store `error_message`, and surface it in an admin UI
+  - optionally store a compact DLQ record: `{document_id, stage, error, pipeline_version, created_at}`
+
+**Operator runbooks (minimum)**
+- **Reprocess a single document:** clear `error_message`, set `status='queued'`, increment `retry_count`, enqueue preprocess.
+- **Burst of failures:** pause ingestion (WhatsApp/web), inspect recent errors grouped by stage, rollback `pipeline_version` if regression.
+- **S3/MinIO outage:** fail fast with clear error, alert; do not loop retries aggressively (exponential backoff).
+
+**Alerting signals (simple but effective)**
+- `failed / total` over 10 minutes > 2%
+- queue depth rising for > 10 minutes
+- watchdog “stuck” count > 0
+- GPU worker down / OOM rate spikes
+
 ---
 
 ## 6. Extraction Strategy
@@ -835,6 +909,118 @@ def detect_rois(image) -> RoiResult:
 - `detect_vertical_split_x()` can use edge detection + vertical projection to find the strongest vertical boundary.
 - Keep a per-source “calibration override” (UI toggle) if you later ingest non-USS sources.
 
+### ROI Detection Implementation (Concrete OpenCV)
+
+ROI detection is a top-3 risk area because it silently affects *everything* downstream. Treat ROI detection as a versioned component (`roi_version`) with unit tests on your golden set.
+
+**Default parameters (starting points)**
+
+| Parameter | Default | Purpose |
+|----------|---------|---------|
+| `HEADER_SCAN_H` | `0.35 * H` | only scan top band for blue header |
+| `HSV_BLUE_LO` | `(90, 50, 40)` | OpenCV HSV lower bound for header blue |
+| `HSV_BLUE_HI` | `(140, 255, 255)` | OpenCV HSV upper bound |
+| `HEADER_MIN_W` | `0.70 * W` | reject narrow blue regions |
+| `HEADER_MIN_H` | `0.06 * H` | reject too-thin noise |
+| `HEADER_MAX_H` | `0.25 * H` | reject too-tall blocks |
+| `SPLIT_X_RANGE` | `[0.45*W, 0.80*W]` | expected sheet/photo boundary band |
+| `CANNY_LO/HI` | `50/150` | edge detection defaults |
+
+```python
+import cv2
+import numpy as np
+from typing import Optional, Tuple
+
+BBox = Tuple[int, int, int, int]  # (x0, y0, x1, y1)
+
+
+def detect_blue_header_bbox(image_bgr: np.ndarray) -> Optional[BBox]:
+    h, w = image_bgr.shape[:2]
+    scan_h = int(0.35 * h)
+    roi = image_bgr[0:scan_h, 0:w]
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (90, 50, 40), (140, 255, 255))
+
+    # Fill gaps from JPEG artifacts and small UI borders.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 25), np.uint8), iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    best = None
+    best_score = -1.0
+    for cnt in contours:
+        x, y, ww, hh = cv2.boundingRect(cnt)
+        if ww < int(0.70 * w):
+            continue
+        if hh < int(0.06 * h) or hh > int(0.25 * h):
+            continue
+        if y > int(0.25 * h):
+            continue
+
+        # Score prefers large, wide, top-most candidates.
+        area = ww * hh
+        score = area - (y * 50)
+        if score > best_score:
+            best_score = score
+            best = (x, y, x + ww, y + hh)
+
+    if best is None:
+        return None
+
+    # Small safety margin
+    x0, y0, x1, y1 = best
+    pad_x = int(0.01 * w)
+    pad_y = int(0.01 * h)
+    return (
+        max(0, x0 - pad_x),
+        max(0, y0 - pad_y),
+        min(w, x1 + pad_x),
+        min(h, y1 + pad_y),
+    )
+
+
+def detect_vertical_split_x(image_bgr: np.ndarray, *, y0: int, y1: int) -> Optional[int]:
+    h, w = image_bgr.shape[:2]
+    y0 = max(0, min(h, y0))
+    y1 = max(0, min(h, y1))
+    if y1 - y0 < int(0.20 * h):
+        return None
+
+    roi = image_bgr[y0:y1, 0:w]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(gray, 50, 150)
+    col = edges.sum(axis=0).astype(np.float32)
+
+    # Smooth to reduce noise and focus on dominant boundaries.
+    col = cv2.GaussianBlur(col.reshape(1, -1), (1, 31), 0).reshape(-1)
+
+    lo = int(0.45 * w)
+    hi = int(0.80 * w)
+    window = col[lo:hi]
+    if window.size == 0:
+        return None
+
+    x = int(np.argmax(window)) + lo
+    # Require the peak to be meaningfully above baseline (tunable).
+    if col[x] < (window.mean() + 2.0 * window.std()):
+        return None
+    return x
+```
+
+**Sanity checks (must pass, else fallback)**
+- `header_bbox` height in `[6%, 25%]` of image height
+- `sheet_bbox` width in `[45%, 80%]` of image width
+- `header_bbox` is above `sheet_bbox` and does not overlap it
+
+**Debugging**
+- When ROI detection falls back to percent crops, store debug artifacts (mask overlay + edge projection) so you can tune thresholds quickly.
+
 
 ### Phase 1: Header Table Extraction (High Priority)
 
@@ -896,6 +1082,34 @@ The header sometimes shows abbreviated mileage (e.g., “走行 8” meaning 8,0
 - store `mileage_raw` exactly as read
 - store `mileage_multiplier` + `mileage_inference_conf`
 - validate against sheet mileage when available
+
+**Suggested mileage parsing rules (make it testable)**
+
+```python
+import re
+
+def parse_mileage_header(token: str):
+    """
+    Returns: (mileage_value, multiplier, confidence)
+    - If multiplier=1000, mileage_km = mileage_value * 1000
+    - Do not auto-pass a record based on inferred mileage unless sheet confirms.
+    """
+    t = (token or "").strip()
+    if not t:
+        return None, None, 0.0
+
+    # Strong signals the header already includes full km.
+    if "," in t or len([c for c in t if c.isdigit()]) >= 4:
+        return int(re.sub(r"\\D", "", t)), 1, 0.95
+
+    # Common USS shorthand: 1-3 digits means "x 1000 km"
+    n = int(re.sub(r"\\D", "", t))
+    if 0 <= n <= 300:
+        return n, 1000, 0.70
+
+    # Ambiguous band: force validation against sheet (or review).
+    return n, 1, 0.30
+```
 
 
 ### Phase 2: Auction Sheet Extraction (Secondary)
@@ -1226,7 +1440,6 @@ Content-Type: multipart/form-data
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
       "status": "queued",
-      "original_path": "originals/550e8400.jpg",
       "thumb_url": "https://storage.../thumbs/550e8400.jpg"
     }
   ],
@@ -1249,7 +1462,7 @@ GET /v1/records?q=taycan+タイカン&mileage_max=50000&score_min=4&page=1&per_p
 - `q` is treated as a raw query string (not pre-tokenized by the client).
 - Backend combines:
   - English/Latin full-text search (`fts_vector_en`) for ranking
-  - JP/EN trigram search on `search_text` for substring/fuzzy matching (works for Japanese without requiring a tokenizer extension)
+  - JP/EN trigram search on `search_text` for substring/fuzzy matching (keep it limited to key fields + notes/options; not full OCR dumps)
   - Exact/fast-path matching when `q` looks like a lot number, model code, or chassis number
 
 ```json
@@ -1496,52 +1709,52 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
 
     for entry in payload.get("entry", []):
-            for change in entry.get("changes", []):
-                if change.get("field") != "messages":
+        for change in entry.get("changes", []):
+            if change.get("field") != "messages":
+                continue
+
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                from_number = message.get("from")
+                message_id = message.get("id")
+                
+                # 2) Idempotency: claim message_id at the DB layer (safe under retries/concurrency)
+                claimed = await db.try_claim_whatsapp_message(
+                    message_id=message_id,
+                    from_number=from_number,
+                    chat_id=value.get("metadata", {}).get("phone_number_id"),
+                    received_at=datetime.utcnow(),
+                    raw_payload=payload,
+                )
+                if not claimed:
                     continue
 
-                value = change.get("value", {})
-                for message in value.get("messages", []):
-                    from_number = message.get("from")
-                    message_id = message.get("id")
-                    
-                    # 2) Idempotency: claim message_id at the DB layer (safe under retries/concurrency)
-                    claimed = await db.try_claim_whatsapp_message(
-                        message_id=message_id,
-                        from_number=from_number,
-                        chat_id=value.get("metadata", {}).get("phone_number_id"),
-                        received_at=datetime.utcnow(),
-                        raw_payload=payload,
-                    )
-                    if not claimed:
-                        continue
+                # 3) Sender allowlist (DB-backed)
+                if not await db.is_sender_allowed(from_number):
+                    await send_reply(from_number, "Sorry, you're not authorized to submit images.")
+                    await db.update_whatsapp_message(message_id, status="rejected", error_message="unauthorized")
+                    continue
 
-                    # 3) Sender allowlist (DB-backed)
-                    if not await db.is_sender_allowed(from_number):
-                        await send_reply(from_number, "Sorry, you're not authorized to submit images.")
-                        await db.update_whatsapp_message(message_id, status="rejected", error_message="unauthorized")
-                        continue
-
-                    # 4) Only accept images
-                    if message.get("type") != "image":
-                        await send_reply(from_number, "Please send an image of the auction sheet.")
-                        await db.update_whatsapp_message(message_id, status="rejected", error_message="not_image")
-                        continue
+                # 4) Only accept images
+                if message.get("type") != "image":
+                    await send_reply(from_number, "Please send an image of the auction sheet.")
+                    await db.update_whatsapp_message(message_id, status="rejected", error_message="not_image")
+                    continue
 
                 image_info = message.get("image", {})
                 media_id = image_info.get("id")
 
                 # 5) Enqueue durable work (prefer Celery/RQ over in-process background tasks)
-                    background_tasks.add_task(
-                        enqueue_whatsapp_ingest,
-                        media_id=media_id,
-                        from_number=from_number,
-                        message_id=message_id,
-                        timestamp=message.get("timestamp"),
-                    )
+                background_tasks.add_task(
+                    enqueue_whatsapp_ingest,
+                    media_id=media_id,
+                    from_number=from_number,
+                    message_id=message_id,
+                    timestamp=message.get("timestamp"),
+                )
 
-                    await db.update_whatsapp_message(message_id, status="queued")
-                    await send_reply(from_number, "📥 Image received! Processing...")
+                await db.update_whatsapp_message(message_id, status="queued")
+                await send_reply(from_number, "📥 Image received! Processing...")
 
     return {"status": "ok"}
 ```
@@ -1724,6 +1937,49 @@ volumes:
 | Redis | Elasticache t3.micro | 1 vCPU, 0.5GB | ~$12 |
 | Storage | S3 | Pay per use | ~$5 |
 | **Total** | | | **~$110-210/month** |
+
+### Security, Retention, Backup/Restore & Rollback (Production Minimums)
+
+#### Security hardening (practical checklist)
+
+- **TLS everywhere:** terminate TLS at Caddy/nginx; enable HSTS; redirect HTTP→HTTPS.
+- **CORS:** allow only your frontend origin(s) in production; do not ship `allow_origins="*"` with credentials.
+- **Auth:** use a modern password hash (Argon2id preferred, bcrypt acceptable) + login rate limiting (e.g., 5/min/IP + 20/hr/user).
+- **Upload safety:** enforce max size (e.g., 10MB), accept only image MIME types, decode the file server-side (reject invalid), and strip metadata on derived images.
+- **Object storage:** never expose `original_path`/bucket keys to clients; return short-lived presigned URLs (`original_url`, `thumb_url`) from the API.
+- **Secrets:** store WhatsApp secrets, JWT secret, and S3 keys in a secret manager (or at minimum env vars); rotate on a schedule.
+- **Audit trail:** keep overrides (who changed what/when) and log admin actions (reprocess, delete, allowlist changes).
+
+#### Data retention (recommended defaults)
+
+| Artifact | Retention | Rationale |
+|----------|-----------|-----------|
+| Originals (`originals/`) | 90 days | ability to reprocess / dispute resolution |
+| Preprocessed (`preprocessed/`) | 30 days | speed up reprocessing while tuning |
+| Thumbnails (`thumbs/`) | 180 days | UI performance |
+| Raw OCR (`ocr_raw/`) | 30 days | debugging + regression investigations |
+| Evidence crops/overlays | 90 days | supports human review + audits |
+| WhatsApp raw payload | 30 days | troubleshooting; minimize stored PII |
+| Structured DB records | indefinite | business record of extraction |
+
+Automate this via S3 lifecycle policies + a daily cleanup job for MinIO dev buckets.
+
+#### Backup & restore verification
+
+- **Postgres:** daily automated backups + at least 30-day retention; run a monthly restore drill into a staging DB and verify basic queries.
+- **S3:** enable bucket versioning (or at least lifecycle + replication if you later scale); treat the OCR artifacts as rebuildable.
+- **Config:** version-control extraction templates and normalization dictionaries; these are part of the “model” in practice.
+
+#### Rollback strategy (for pipeline/model regressions)
+
+- **Versioning:** set `pipeline_version` (e.g., `uss-v1.2.0`) and `model_version` on every processed document.
+- **Release gating:** run the regression suite on the golden set before promoting a new version; fail promotion on SLO regression.
+- **Fast rollback:** keep the previous worker/API container images; rollback is "deploy previous image + set current pipeline_version pointer".
+- **Targeted reprocessing:** allow re-running a subset (e.g., last 48 hours) under the previous version to correct regressions without wiping history.
+
+#### Trigram index maintenance (JP/EN search)
+
+`pg_trgm` indexes can bloat over time. Track DB size + autovacuum stats; if needed, schedule a periodic `REINDEX CONCURRENTLY` during low-traffic windows.
 
 ---
 
