@@ -33,16 +33,18 @@ def extract_header(image, header_bbox) -> HeaderExtraction:
         table_cells, table_cell_count = _extract_table_cells(crop)
         if table_cells:
             method = "ppstructure"
+
+    # Always run fallback OCR to get additional tokens
+    # The VL OCR often has table parsing issues with auction headers
     fallback = None
-    if not primary.tokens:
-        try:
-            fallback = run_ocr(
-                binarize_image(crop),
-                lang="japan",
-                engine_preference=["paddle", "tesseract"],
-            )
-        except Exception:
-            fallback = None
+    try:
+        fallback = run_ocr(
+            binarize_image(crop),
+            lang="japan",
+            engine_preference=["paddle", "tesseract"],
+        )
+    except Exception:
+        fallback = None
 
     primary = _offset_result(primary, header_bbox)
     if fallback:

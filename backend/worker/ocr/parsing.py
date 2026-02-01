@@ -254,11 +254,667 @@ def parse_header_cells(cells: dict[str, str]) -> dict[str, ParsedField]:
     results: dict[str, ParsedField] = {}
     for label, value in cells.items():
         label_norm = normalize_text(label)
-        for key, patterns in LABEL_MAP.items():
-            if any(re.search(pat, label_norm) for pat in patterns):
-                if key not in results:
-                    results[key] = ParsedField(value=value, confidence=0.97, bbox=None, raw=value)
+        value_norm = normalize_text(value) if value else ""
+
+        # Handle compound labels with "/" separator
+        parsed = _parse_compound_cell(label_norm, value_norm, value)
+        for key, field in parsed.items():
+            if key not in results:
+                results[key] = field
+
+        # Fall back to simple label matching for non-compound labels
+        if not parsed:
+            for key, patterns in LABEL_MAP.items():
+                if any(re.search(pat, label_norm) for pat in patterns):
+                    if key not in results:
+                        results[key] = ParsedField(value=value, confidence=0.97, bbox=None, raw=value)
     return results
+
+
+def parse_header_tokens_vl(tokens: list[OCRToken]) -> dict[str, ParsedField]:
+    """Parse header tokens from VL OCR that combine 'label value' in single tokens."""
+    results: dict[str, ParsedField] = {}
+
+    for token in tokens:
+        text = token.text or ""
+        text_norm = normalize_text(text)
+
+        # Try to extract known label-value pairs from combined token text
+        extracted = _extract_from_combined_token(text_norm, text, token.bbox)
+        for key, field in extracted.items():
+            if key not in results:
+                results[key] = field
+
+    # Also try pattern-based extraction on all token text combined
+    all_text = " ".join([t.text or "" for t in tokens])
+    pattern_results = _extract_header_by_patterns(all_text)
+    for key, field in pattern_results.items():
+        if key not in results:
+            results[key] = field
+
+    return results
+
+
+def _extract_header_by_patterns(text: str) -> dict[str, ParsedField]:
+    """Extract header values by pattern matching on combined text."""
+    results: dict[str, ParsedField] = {}
+    text_norm = normalize_text(text)
+
+    # Date pattern (e.g., "24/10/18" or "2024-10-18")
+    if "auction_date" not in results:
+        date_match = re.search(r"\b(\d{2,4}[/.-]\d{1,2}[/.-]\d{1,2})\b", text_norm)
+        if date_match:
+            results["auction_date"] = ParsedField(
+                value=date_match.group(1), confidence=0.7, bbox=None, raw=date_match.group(0)
+            )
+
+    # Venue pattern (major auction venues)
+    if "auction_venue" not in results:
+        venues = ["東京", "名古屋", "大阪", "福岡", "札幌", "仙台", "広島"]
+        for venue in venues:
+            if venue in text:
+                results["auction_venue"] = ParsedField(
+                    value=venue, confidence=0.8, bbox=None, raw=venue
+                )
+                break
+
+    # Round pattern (e.g., "2057回" or "1488回")
+    if "auction_venue_round" not in results:
+        round_match = re.search(r"(\d{3,4})回", text_norm)
+        if round_match:
+            results["auction_venue_round"] = ParsedField(
+                value=round_match.group(0), confidence=0.8, bbox=None, raw=round_match.group(0)
+            )
+
+    # Lot number pattern (5-digit number, usually near 出品番号)
+    if "lot_no" not in results:
+        lot_match = re.search(r"(?:出品番号|No\.?)\s*[:\s]*(\d{4,6})", text_norm)
+        if lot_match:
+            results["lot_no"] = ParsedField(
+                value=lot_match.group(1), confidence=0.8, bbox=None, raw=lot_match.group(0)
+            )
+        else:
+            # Look for standalone 5-digit number that's NOT a round number
+            lot_standalone = re.findall(r"\b(\d{4,6})\b", text_norm)
+            for lot_candidate in lot_standalone:
+                # Skip if it's part of a round pattern (ends with 回)
+                if f"{lot_candidate}回" in text_norm:
+                    continue
+                # Skip if it's a date
+                if "/" in text_norm and lot_candidate in text_norm.split("/"):
+                    continue
+                results["lot_no"] = ParsedField(
+                    value=lot_candidate, confidence=0.6, bbox=None, raw=lot_candidate
+                )
+                break
+
+    # Year pattern (e.g., "R05", "R03", "令和5年")
+    # Must NOT be followed by 回 (that's the round pattern)
+    if "model_year" not in results:
+        year_match = re.search(r"\bR\s*(\d{1,2})(?!回|\d)", text_norm)
+        if year_match:
+            year_val = year_match.group(1)
+            # Year should be reasonable (1-10 for Reiwa, started 2019)
+            if year_val.isdigit() and 1 <= int(year_val) <= 10:
+                results["model_year"] = ParsedField(
+                    value=f"R{year_val.zfill(2)}",
+                    confidence=0.8, bbox=None, raw=year_match.group(0)
+                )
+
+    # Transmission pattern (AT, FA, CA, CVT, MT)
+    if "shift_engine" not in results:
+        trans_match = re.search(r"\b(AT|FA|CA|CVT|MT)\b", text_norm, re.IGNORECASE)
+        if trans_match:
+            # Also try to find engine CC nearby
+            engine_match = re.search(r"(\d{3,4})\s*(?:cc)?", text_norm, re.IGNORECASE)
+            engine_val = engine_match.group(1) if engine_match else ""
+            combined = f"{trans_match.group(1).upper()} {engine_val}".strip()
+            results["shift_engine"] = ParsedField(
+                value=combined, confidence=0.7, bbox=None, raw=combined
+            )
+
+    # Score pattern (e.g., "4.5", "5", "R", "RA")
+    if "score" not in results:
+        # First check for R or RA (problem cars)
+        ra_match = re.search(r"\b(RA?)\b(?!\d)", text_norm)
+        if ra_match and "評価" in text_norm:
+            results["score"] = ParsedField(
+                value=ra_match.group(1), confidence=0.7, bbox=None, raw=ra_match.group(0)
+            )
+        else:
+            # Numeric score
+            score_match = re.search(r"\b([1-5](?:\.[05])?)\b", text_norm)
+            if score_match:
+                results["score"] = ParsedField(
+                    value=score_match.group(1), confidence=0.6, bbox=None, raw=score_match.group(0)
+                )
+
+    # Result pattern (落札 = sold, 流札 = unsold)
+    if "result" not in results:
+        if "落札" in text:
+            results["result"] = ParsedField(
+                value="落札", confidence=0.9, bbox=None, raw="落札"
+            )
+        elif "流札" in text:
+            results["result"] = ParsedField(
+                value="流札", confidence=0.9, bbox=None, raw="流札"
+            )
+
+    # Bid pattern (e.g., "3,040万円" or "30400000")
+    if "final_bid" not in results:
+        # Look for 万円 format first
+        man_match = re.search(r"(\d{1,4}(?:,\d{3})*)万", text_norm)
+        if man_match:
+            results["final_bid"] = ParsedField(
+                value=man_match.group(1).replace(",", ""),
+                confidence=0.7, bbox=None, raw=man_match.group(0)
+            )
+        else:
+            # Look for raw large numbers (likely in yen)
+            large_num = re.search(r"(\d{7,9})", text_norm)
+            if large_num:
+                results["final_bid"] = ParsedField(
+                    value=large_num.group(1), confidence=0.5, bbox=None, raw=large_num.group(0)
+                )
+
+    # Color pattern (common colors in Japanese)
+    if "color" not in results:
+        colors = ["パール", "ホワイト", "ブラック", "クロ", "グレー", "シルバー", "レッド", "ブルー", "ゴールド", "ベージュ", "ブラウン"]
+        for color in colors:
+            if color in text:
+                results["color"] = ParsedField(
+                    value=color, confidence=0.8, bbox=None, raw=color
+                )
+                break
+
+    # Mileage pattern (digits + km or ㎞)
+    if "mileage" not in results:
+        mileage_match = re.search(r"(\d{2,6})(?:,\d{3})*\s*(?:km|㎞|ｋｍ)", text_norm, re.IGNORECASE)
+        if mileage_match:
+            results["mileage"] = ParsedField(
+                value=mileage_match.group(1), confidence=0.7, bbox=None, raw=mileage_match.group(0)
+            )
+
+    # Inspection expiry pattern (e.g., "R08.03", "R07.12")
+    if "inspection" not in results:
+        insp_match = re.search(r"R\s*(\d{1,2})[./](\d{1,2})", text_norm)
+        if insp_match:
+            results["inspection"] = ParsedField(
+                value=f"R{insp_match.group(1).zfill(2)}.{insp_match.group(2).zfill(2)}",
+                confidence=0.7, bbox=None, raw=insp_match.group(0)
+            )
+
+    # Model code pattern (alphanumeric, e.g., "MXUA80", "VJA300W", "ZN8")
+    if "model_code" not in results:
+        model_patterns = [
+            r"\b([A-Z]{2,4}\d{1,3}[A-Z]?)\b",  # e.g., MXUA80, VJA300W
+            r"\b(\d{5,6}[A-Z])\b",  # e.g., 118347M
+            r"\b([A-Z]\d[A-Z]{2})\b",  # e.g., J1NE
+        ]
+        for pattern in model_patterns:
+            match = re.search(pattern, text_norm)
+            if match:
+                model_code = match.group(1)
+                # Skip if it looks like a chassis number (too long)
+                if len(model_code) <= 10:
+                    results["model_code"] = ParsedField(
+                        value=model_code, confidence=0.6, bbox=None, raw=match.group(0)
+                    )
+                    break
+
+    return results
+
+
+def _extract_from_combined_token(
+    text_norm: str, raw_text: str, bbox: tuple[int, int, int, int] | None
+) -> dict[str, ParsedField]:
+    """Extract field values from a token that contains 'label value' combined."""
+    results: dict[str, ParsedField] = {}
+
+    # 開催日 + date pattern (e.g., "開催日 24/10/18")
+    date_match = re.search(r"開催日\s*[:\s]*(\d{2,4}[/.-]\d{1,2}[/.-]\d{1,2})", text_norm)
+    if date_match:
+        results["auction_date"] = ParsedField(
+            value=date_match.group(1), confidence=0.9, bbox=bbox, raw=raw_text
+        )
+
+    # Also look for standalone date pattern if it starts with a date
+    if "開催日" not in text_norm:
+        standalone_date = re.match(r"^(\d{2,4}[/.-]\d{1,2}[/.-]\d{1,2})\b", text_norm)
+        if standalone_date:
+            results["auction_date"] = ParsedField(
+                value=standalone_date.group(1), confidence=0.7, bbox=bbox, raw=raw_text
+            )
+
+    # 出品番号 + number (e.g., "出品番号 35408")
+    lot_match = re.search(r"出品番号\s*[:\s]*(\d{3,8})", text_norm)
+    if lot_match:
+        results["lot_no"] = ParsedField(
+            value=lot_match.group(1), confidence=0.9, bbox=bbox, raw=raw_text
+        )
+
+    # Look for standalone 5-digit lot number at start of token
+    if "lot_no" not in results and "出品番号" not in text_norm:
+        lot_standalone = re.match(r"^(\d{4,6})\b", text_norm)
+        if lot_standalone:
+            results["lot_no"] = ParsedField(
+                value=lot_standalone.group(1), confidence=0.6, bbox=bbox, raw=raw_text
+            )
+
+    # 会場 + venue name (Japanese chars)
+    venue_match = re.search(r"会場\s*[:\s]*([\u4E00-\u9FFF]+)", text_norm)
+    if venue_match:
+        results["auction_venue"] = ParsedField(
+            value=venue_match.group(1), confidence=0.9, bbox=bbox, raw=raw_text
+        )
+
+    # 開催回 + round number
+    round_match = re.search(r"開催回?\s*[:\s]*(\d+回?)", text_norm)
+    if round_match:
+        round_val = round_match.group(1)
+        if not round_val.endswith("回"):
+            round_val += "回"
+        results["auction_venue_round"] = ParsedField(
+            value=round_val, confidence=0.9, bbox=bbox, raw=raw_text
+        )
+
+    # 年式 + Reiwa year (R## or just digits)
+    year_match = re.search(r"年式\s*[:\s]*(R?\d{1,2})", text_norm)
+    if year_match:
+        year_val = year_match.group(1)
+        if not year_val.startswith("R"):
+            year_val = "R" + year_val
+        results["model_year"] = ParsedField(
+            value=year_val, confidence=0.9, bbox=bbox, raw=raw_text
+        )
+
+    # 車種名/グレード - extract make/model and grade
+    if "車種名" in text_norm or "グレード" in text_norm:
+        # Remove the labels and get the value
+        value = re.sub(r"車種名|グレード|/", " ", text_norm).strip()
+        if value:
+            make_model, grade = _split_make_model_grade(value)
+            if make_model:
+                results["make_model"] = ParsedField(
+                    value=make_model, confidence=0.85, bbox=bbox, raw=raw_text
+                )
+            if grade:
+                results["grade"] = ParsedField(
+                    value=grade, confidence=0.85, bbox=bbox, raw=raw_text
+                )
+
+    # シフト/排気量 - extract transmission and engine cc
+    if "シフト" in text_norm or "排気量" in text_norm or "ミッション" in text_norm:
+        value = re.sub(r"シフト|排気量|ミッション|/", " ", text_norm).strip()
+        if value:
+            trans, engine = _split_shift_engine(value)
+            if trans or engine:
+                engine_str = str(engine) if engine else ""
+                results["shift_engine"] = ParsedField(
+                    value=f"{trans or ''} {engine_str}".strip(),
+                    confidence=0.85, bbox=bbox, raw=raw_text
+                )
+
+    # 走行/車検 - extract mileage and inspection
+    if "走行" in text_norm:
+        # Remove labels
+        value = re.sub(r"走行|車検|/|距離|km|㎞", " ", text_norm, flags=re.IGNORECASE).strip()
+        if value:
+            mileage, inspection = _split_mileage_inspection(value)
+            if mileage:
+                results["mileage"] = ParsedField(
+                    value=mileage, confidence=0.85, bbox=bbox, raw=raw_text
+                )
+            if inspection:
+                results["inspection"] = ParsedField(
+                    value=inspection, confidence=0.85, bbox=bbox, raw=raw_text
+                )
+
+    # 色 - color
+    if "色" in text_norm and len(text_norm) > 1:
+        # Remove the label
+        value = re.sub(r"色|カラー", " ", text_norm).strip()
+        # Color values are typically short Japanese words
+        color_match = re.search(
+            r"(パール|ホワイト|ブラック|クロ|グレー|シルバー|レッド|ブルー|ゴールド|ベージュ)",
+            value, re.IGNORECASE
+        )
+        if color_match:
+            results["color"] = ParsedField(
+                value=color_match.group(1), confidence=0.85, bbox=bbox, raw=raw_text
+            )
+        elif value and not any(x in value for x in ["型式", "装備", "エアコン"]):
+            # Use the first word as color if it's not another label
+            first_word = value.split()[0] if value.split() else value
+            if first_word and len(first_word) <= 8:
+                results["color"] = ParsedField(
+                    value=first_word, confidence=0.7, bbox=bbox, raw=raw_text
+                )
+
+    # 型式 - model code
+    if "型式" in text_norm:
+        # Remove labels
+        value = re.sub(r"型式|エアコン|装備|/", " ", text_norm).strip()
+        if value:
+            model_code, _ = _split_model_equipment(value)
+            if model_code:
+                results["model_code"] = ParsedField(
+                    value=model_code, confidence=0.85, bbox=bbox, raw=raw_text
+                )
+
+    # セリ結果 - auction result
+    if "セリ結果" in text_norm or "結果" in text_norm:
+        if "落札" in text_norm:
+            results["result"] = ParsedField(
+                value="落札", confidence=0.9, bbox=bbox, raw=raw_text
+            )
+        elif "流札" in text_norm:
+            results["result"] = ParsedField(
+                value="流札", confidence=0.9, bbox=bbox, raw=raw_text
+            )
+
+    # 応札額/スタート金額 - bids
+    if ("応札" in text_norm or "スタート" in text_norm) and "金額" in text_norm:
+        value = re.sub(r"応札額?|スタート金額|/|万円|円", " ", text_norm).strip()
+        numbers = re.findall(r"\d[\d,]*", value)
+        if numbers:
+            if len(numbers) >= 2:
+                results["final_bid"] = ParsedField(
+                    value=numbers[0], confidence=0.85, bbox=bbox, raw=raw_text
+                )
+                results["starting_bid"] = ParsedField(
+                    value=numbers[1], confidence=0.85, bbox=bbox, raw=raw_text
+                )
+            elif len(numbers) == 1:
+                results["final_bid"] = ParsedField(
+                    value=numbers[0], confidence=0.7, bbox=bbox, raw=raw_text
+                )
+
+    # 評価点 - score
+    if "評価" in text_norm or "点" in text_norm:
+        value = re.sub(r"評価点?|瑕疵", " ", text_norm).strip()
+        score = _extract_score_value(value)
+        if score:
+            results["score"] = ParsedField(
+                value=score, confidence=0.85, bbox=bbox, raw=raw_text
+            )
+
+    return results
+
+
+def _parse_compound_cell(label: str, value_norm: str, raw_value: str) -> dict[str, ParsedField]:
+    """Parse cells with compound labels like '車種名/グレード' or '走行/車検'."""
+    results: dict[str, ParsedField] = {}
+
+    # 車種名/グレード → make_model + grade
+    if "車種名" in label and "グレード" in label:
+        make_model, grade = _split_make_model_grade(value_norm)
+        if make_model:
+            results["make_model"] = ParsedField(value=make_model, confidence=0.95, bbox=None, raw=raw_value)
+        if grade:
+            results["grade"] = ParsedField(value=grade, confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 車種名 alone (without グレード) - full value is make_model
+    if "車種名" in label and "グレード" not in label:
+        results["make_model"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # グレード alone
+    if "グレード" in label and "車種名" not in label:
+        results["grade"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # シフト/排気量 → transmission + engine_cc
+    if ("シフト" in label or "ミッション" in label) and "排気量" in label:
+        trans, engine = _split_shift_engine(value_norm)
+        if trans:
+            results["shift_engine"] = ParsedField(value=f"{trans} {engine or ''}", confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 走行/車検 → mileage + inspection
+    if "走行" in label and "車検" in label:
+        mileage, inspection = _split_mileage_inspection(value_norm)
+        if mileage:
+            results["mileage"] = ParsedField(value=mileage, confidence=0.95, bbox=None, raw=raw_value)
+        if inspection:
+            results["inspection"] = ParsedField(value=inspection, confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 走行 alone
+    if "走行" in label and "車検" not in label:
+        results["mileage"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # 車検 alone
+    if "車検" in label and "走行" not in label:
+        results["inspection"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # 型式/エアコン/装備 or 型式 → model_code (+ equipment_codes)
+    if "型式" in label:
+        model_code, equipment = _split_model_equipment(value_norm)
+        if model_code:
+            results["model_code"] = ParsedField(value=model_code, confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 応札額/スタート金額 → final_bid + starting_bid
+    if ("応札" in label or "落札" in label) and "スタート" in label:
+        final_bid, start_bid = _split_bids(value_norm)
+        if final_bid:
+            results["final_bid"] = ParsedField(value=final_bid, confidence=0.95, bbox=None, raw=raw_value)
+        if start_bid:
+            results["starting_bid"] = ParsedField(value=start_bid, confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 応札額 or 落札 alone
+    if "落札" in label or "応札額" in label:
+        results["final_bid"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # スタート金額 alone
+    if "スタート" in label:
+        results["starting_bid"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # セリ結果 (auction result)
+    if "セリ結果" in label or "結果" in label:
+        results["result"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    # 評価点 (score)
+    if "評価" in label or "点" in label:
+        score = _extract_score_value(value_norm)
+        if score:
+            results["score"] = ParsedField(value=score, confidence=0.95, bbox=None, raw=raw_value)
+        return results
+
+    # 色 (color)
+    if "色" in label:
+        results["color"] = ParsedField(value=raw_value, confidence=0.97, bbox=None, raw=raw_value)
+        return results
+
+    return results
+
+
+def _split_make_model_grade(value: str) -> tuple[str | None, str | None]:
+    """Split combined make_model and grade value.
+
+    Japanese auction format typically has:
+    - Make/Model as first part (e.g., 'MB CLAクラス', 'ポル タイカン')
+    - Grade as remainder (e.g., 'CLA250 4M AMGライン', 'GTS 4+1シート')
+    """
+    if not value:
+        return None, None
+
+    # Try to find a natural split point - grades often start with alphanumeric codes
+    # or version indicators like digits, letters, or specific keywords
+    value = value.strip()
+
+    # Common grade patterns: alphanumeric code at start of grade
+    # e.g., "CLA250", "RZ", "GTS", "NX250", etc.
+    patterns = [
+        # Grade starts with a model variant code (letters + numbers)
+        r"^(.+?)\s+([A-Z]{1,3}\d{2,4}[A-Z]?\s*.*)$",
+        # Grade starts with a short code like "RZ", "GTS", "G", "S"
+        r"^(.+?)\s+([A-Z]{1,3}(?:\s+.*)?)$",
+        # Grade with specific keywords
+        r"^(.+?)\s+(バージョン.*)$",
+        r"^(.+?)\s+(Fスポーツ.*)$",
+        r"^(.+?)\s+(Mスポ.*)$",
+        r"^(.+?)\s+(AMG.*)$",
+        r"^(.+?)\s+(レザー.*)$",
+        r"^(.+?)\s+(Cパッケージ.*)$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, value, re.IGNORECASE)
+        if match:
+            make_model = match.group(1).strip()
+            grade = match.group(2).strip()
+            # Validate: make_model should contain Japanese chars or known make names
+            if re.search(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]|MB|BMW|ポル|GR", make_model):
+                return make_model, grade
+
+    # If no pattern matched, try splitting on common delimiters
+    # Look for space followed by uppercase letter or digit
+    parts = re.split(r"\s+", value, maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+
+    # No split found, return full value as make_model
+    return value, None
+
+
+def _split_shift_engine(value: str) -> tuple[str | None, int | None]:
+    """Split shift/transmission and engine cc from combined value."""
+    if not value:
+        return None, None
+
+    # Find transmission type
+    trans_match = re.search(r"(AT|FA|CA|CVT|MT)", value, re.IGNORECASE)
+    trans = trans_match.group(1).upper() if trans_match else None
+
+    # Find engine displacement - typically 3-4 digit number
+    # EV cars may have "EV" instead
+    if "EV" in value.upper():
+        return trans, None
+
+    engine_match = re.search(r"(\d{3,4})", value)
+    engine = int(engine_match.group(1)) if engine_match else None
+
+    return trans, engine
+
+
+def _split_mileage_inspection(value: str) -> tuple[str | None, str | None]:
+    """Split mileage and inspection date from combined value."""
+    if not value:
+        return None, None
+
+    # Mileage is typically a number (possibly with commas)
+    # Inspection is typically a date like "R08.03" or "R07.12"
+    mileage = None
+    inspection = None
+
+    # Look for mileage: digits possibly with commas
+    mileage_match = re.search(r"(\d[\d,]*)", value)
+    if mileage_match:
+        mileage = mileage_match.group(1)
+
+    # Look for inspection: R + year + period + month
+    insp_match = re.search(r"R\d{1,2}[./年]\d{1,2}", value)
+    if insp_match:
+        inspection = insp_match.group(0)
+    else:
+        # Try other date formats like "令和8年3月" or just digits after mileage
+        insp_match2 = re.search(r"(?:令和)?(\d{1,2})[./年](\d{1,2})", value)
+        if insp_match2:
+            inspection = f"R{insp_match2.group(1)}.{insp_match2.group(2).zfill(2)}"
+
+    return mileage, inspection
+
+
+def _split_model_equipment(value: str) -> tuple[str | None, str | None]:
+    """Split model code from equipment codes.
+
+    Model codes are typically alphanumeric (e.g., '118347M', 'AAZA20', 'VJA300W')
+    Equipment codes are keywords like 'AAC', 'ナビ', 'SR', etc.
+    """
+    if not value:
+        return None, None
+
+    # Model code is typically at the start - alphanumeric pattern
+    model_match = re.match(r"^([A-Z0-9]{3,12})", value, re.IGNORECASE)
+    if model_match:
+        model_code = model_match.group(1)
+        remainder = value[len(model_code):].strip()
+        equipment = remainder if remainder else None
+        return model_code, equipment
+
+    # If no clear alphanumeric prefix, look for model code pattern anywhere
+    model_patterns = [
+        r"(\d{5,6}[A-Z])",  # Like 118347M
+        r"([A-Z]{2,4}\d{2,3}[A-Z]?)",  # Like AAZA20, VJA300W
+        r"([A-Z]{1,2}\d[A-Z]{1,2})",  # Like J1NE
+    ]
+
+    for pattern in model_patterns:
+        match = re.search(pattern, value)
+        if match:
+            return match.group(1), None
+
+    return None, None
+
+
+def _split_bids(value: str) -> tuple[str | None, str | None]:
+    """Split final bid and starting bid from combined value."""
+    if not value:
+        return None, None
+
+    # Find all numbers in the value (could be with commas or in 万円 format)
+    numbers = re.findall(r"(\d[\d,]*)", value)
+
+    if not numbers:
+        return None, None
+
+    if len(numbers) == 1:
+        return numbers[0], None
+
+    # First number is typically final bid, second is starting bid
+    return numbers[0], numbers[1]
+
+
+def _extract_score_value(value: str) -> str | None:
+    """Extract evaluation score from value, handling OCR errors."""
+    if not value:
+        return None
+
+    # Common OCR confusions for score values
+    value_cleaned = value.strip()
+
+    # Handle "RA" or "R" scores (problem cars)
+    if re.search(r"R\s*A", value_cleaned, re.IGNORECASE):
+        return "RA"
+    if re.match(r"R$", value_cleaned, re.IGNORECASE):
+        return "R"
+
+    # Look for numeric score (0-5, possibly with .5)
+    score_match = re.search(r"(\d(?:\.\d)?)", value_cleaned)
+    if score_match:
+        return score_match.group(1)
+
+    # Handle common OCR errors
+    # "联説" etc. might be OCR errors for numbers
+    ocr_fixes = {
+        "联": "4",
+        "說": "5",
+        "联説": "4.5",
+    }
+    for error, fix in ocr_fixes.items():
+        if error in value_cleaned:
+            return fix
+
+    return value_cleaned
 
 
 def parse_sheet(tokens: list[OCRToken]) -> dict[str, ParsedField]:
@@ -282,17 +938,28 @@ def parse_sheet(tokens: list[OCRToken]) -> dict[str, ParsedField]:
 
     full_text = "\n".join([entry["text"] for entry in row_entries if entry["text"]])
 
+    # Try multiple strategies to find chassis number
     chassis_field = _find_labeled_value(
         row_entries,
         [r"車台", r"車体", r"車台No", r"車台番号", r"車両No", r"車体番号"],
-        value_regex=r"[A-HJ-NPR-Z0-9-]{8,20}",
+        value_regex=r"[A-HJ-NPR-Z0-9=-]{8,20}",
     )
     if not chassis_field:
         chassis_field = _find_regex_field(
-            full_text, r"(?:車台|車体)[:\s]*([A-HJ-NPR-Z0-9-]{8,20})"
+            full_text, r"(?:車台|車体)[:\s]*([A-HJ-NPR-Z0-9=-]{8,20})"
         )
     if not chassis_field:
-        chassis_field = _find_regex_field(full_text, r"\b([A-HJ-NPR-Z0-9-]{8,20})\b")
+        # Use improved pattern matching for various chassis formats
+        chassis_candidates = _find_chassis_patterns(full_text)
+        if chassis_candidates:
+            # Pick the longest candidate as it's likely the most complete
+            best_candidate = max(chassis_candidates, key=len)
+            chassis_field = ParsedField(
+                value=best_candidate, confidence=0.6, bbox=None, raw=best_candidate
+            )
+    if not chassis_field:
+        chassis_field = _find_regex_field(full_text, r"\b([A-HJ-NPR-Z0-9=-]{8,20})\b")
+
     if chassis_field:
         normalized = _normalize_chassis_value(str(chassis_field.value))
         if normalized:
@@ -313,6 +980,20 @@ def parse_sheet(tokens: list[OCRToken]) -> dict[str, ParsedField]:
         mileage_field = _find_regex_field(
             full_text, r"走行[:\s]*([0-9,]+)\s*(?:km|㎞|ｋｍ|KM)?"
         )
+    if not mileage_field:
+        # Look for patterns like "21300km" or digits followed by km suffix
+        mileage_match = re.search(
+            r"(\d{2,6})(?:km|kふ|㎞|ｋｍ|KM)",
+            normalize_text(full_text),
+            re.IGNORECASE,
+        )
+        if mileage_match:
+            mileage_field = ParsedField(
+                value=mileage_match.group(1),
+                confidence=0.7,
+                bbox=None,
+                raw=mileage_match.group(0),
+            )
     if mileage_field:
         results["mileage"] = mileage_field
 
@@ -570,14 +1251,78 @@ def _extract_damage_codes(text: str) -> list[str]:
 def _normalize_chassis_value(value: str) -> str | None:
     if not value:
         return None
-    normalized = normalize_alnum(value)
+
+    # First, handle common OCR character confusions in raw text
+    # These patterns are based on observed OCR errors
+    text = value.upper()
+    text = text.replace("=", "-")  # = often misread for -
+    text = text.replace("_", "-")
+    text = text.replace(" ", "")
+
+    # Normalize to alphanumeric
+    normalized = normalize_alnum(text)
     if not normalized:
         return None
-    # VINs avoid I/O/Q; map OCR confusions when seen.
+
+    # VINs avoid I/O/Q; map OCR confusions when seen
     normalized = normalized.replace("I", "1").replace("O", "0").replace("Q", "0")
+
+    # Handle specific OCR confusion patterns for Japanese model codes
+    # e.g., "0N0N80" should be "MXUA80" - this is harder to fix generically
+    # but we can try to match known patterns and restore them
+
     if len(normalized) < 6:
         return None
+
     return normalized
+
+
+def _find_chassis_patterns(text: str) -> list[str]:
+    """Find potential chassis numbers using multiple patterns."""
+    results = []
+    text_norm = normalize_text(text)
+
+    # Pattern 1: Standard VIN format (17 alphanumeric, no I/O/Q)
+    vin_matches = re.findall(r"[A-HJ-NPR-Z0-9]{17}", text_norm, re.IGNORECASE)
+    results.extend(vin_matches)
+
+    # Pattern 2: Japanese model code format: PREFIX-SERIAL (e.g., MXUA80-0040656, VJA300-4081487)
+    jp_model_matches = re.findall(
+        r"([A-Z]{2,6}\d{1,3}[A-Z]?)[-=]?(\d{5,8})",
+        text_norm,
+        re.IGNORECASE,
+    )
+    for prefix, serial in jp_model_matches:
+        results.append(f"{prefix}-{serial}")
+
+    # Pattern 3: Short prefix with serial (e.g., ZN8-028109)
+    short_matches = re.findall(
+        r"([A-Z]{2,4}\d?)[-=]?(\d{5,7})",
+        text_norm,
+        re.IGNORECASE,
+    )
+    for prefix, serial in short_matches:
+        combined = f"{prefix}-{serial}"
+        if combined not in results:
+            results.append(combined)
+
+    # Pattern 4: Mercedes/BMW style (e.g., W1K1183472N307785)
+    euro_matches = re.findall(
+        r"W[A-Z0-9]{2}[A-Z0-9]{11,14}",
+        text_norm,
+        re.IGNORECASE,
+    )
+    results.extend(euro_matches)
+
+    # Pattern 5: Porsche style (e.g., WP0ZZZY1ZPSA85157)
+    porsche_matches = re.findall(
+        r"WP0[A-Z0-9]{14}",
+        text_norm,
+        re.IGNORECASE,
+    )
+    results.extend(porsche_matches)
+
+    return results
 
 
 def _row_bbox(tokens: list[OCRToken]) -> tuple[int, int, int, int] | None:

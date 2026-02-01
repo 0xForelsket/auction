@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -21,12 +22,15 @@ ROOT = Path(__file__).resolve().parents[2]
 CSV_PATH = ROOT / "example_images" / "ground_truth.csv"
 IMAGES_DIR = ROOT / "example_images"
 
+sys.path.insert(0, str(ROOT / "backend"))
+
 from worker.ocr import decode_image, detect_rois, extract_header, extract_sheet
 from worker.ocr.parsing import (
     build_record_fields,
     merge_fields,
     parse_header,
     parse_header_cells,
+    parse_header_tokens_vl,
     parse_sheet,
 )
 
@@ -79,19 +83,66 @@ def _load_rows() -> list[dict[str, str]]:
 
 
 def _build_record(image_path: Path) -> dict:
+    from worker.ocr.parsing import _extract_header_by_patterns, ParsedField
+
     image = decode_image(image_path.read_bytes())
     rois = detect_rois(image)
     header = extract_header(image, rois.header_bbox)
     sheet = extract_sheet(image, rois.sheet_bbox)
 
-    header_fields_line = parse_header(header.primary.tokens)
-    header_fields = header_fields_line
+    # Collect all tokens from both primary and fallback
+    all_tokens = list(header.primary.tokens)
+    if header.fallback and header.fallback.tokens:
+        all_tokens.extend(header.fallback.tokens)
+
+    # Parse using label-based strategies first
+    header_fields_line = parse_header(all_tokens)
+    header_fields_vl = parse_header_tokens_vl(all_tokens)
+
+    # Table cells parsing (if available) - often wrong for auction headers
+    header_fields_table = {}
     if header.table_cells and header.table_cell_count >= 8:
         header_fields_table = parse_header_cells(header.table_cells)
-        header_fields = merge_fields(header_fields_table, header_fields_line)
+
+    # Start with table cells (lowest priority, often wrong)
+    header_fields = header_fields_table
+
+    # Merge in line-parsed fields
+    header_fields = merge_fields(header_fields, header_fields_line)
+
+    # Merge in VL-parsed fields (higher priority)
+    header_fields = merge_fields(header_fields, header_fields_vl)
+
+    # Finally, apply pattern-based extraction as highest priority override
+    # This catches known patterns like venue names, dates, rounds
+    all_text = " ".join([t.text or "" for t in all_tokens])
+    pattern_fields = _extract_header_by_patterns(all_text)
+    # Only override if pattern extraction found a value and it looks valid
+    for key, field in pattern_fields.items():
+        if field.value and field.confidence >= 0.7:
+            if key not in header_fields or not _is_valid_field_value(key, header_fields.get(key)):
+                header_fields[key] = field
 
     sheet_fields = parse_sheet(sheet.tokens)
     return build_record_fields(header_fields, sheet_fields)
+
+
+def _is_valid_field_value(key: str, field) -> bool:
+    """Check if a field value looks valid for the given key."""
+    if field is None:
+        return False
+    value = str(field.value) if field.value else ""
+    if not value:
+        return False
+
+    # Check for common invalid patterns (labels being used as values)
+    invalid_patterns = ["開催回", "出品番号", "会場", "車種名", "グレード", "シフト", "排気量",
+                        "走行", "車検", "色", "型式", "セリ結果", "応札額", "評価点", "装備"]
+    for pattern in invalid_patterns:
+        if pattern in value and len(value) < len(pattern) + 5:
+            return False
+
+    return True
 
 
 def _expect_in(actual: str, expected: str) -> bool:
