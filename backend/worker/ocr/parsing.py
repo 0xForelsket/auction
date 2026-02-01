@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from statistics import median
 from typing import Iterable
@@ -41,13 +42,40 @@ EQUIPMENT_CODES = {"AAC", "ナビ", "SR", "AW", "革", "PS", "PW", "DR"}
 
 
 def normalize_text(text: str) -> str:
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
     return (
         text.replace(" ", "")
         .replace("　", "")
         .replace("：", ":")
         .replace("／", "/")
         .replace("ー", "-")
+        .replace("‐", "-")
+        .replace("－", "-")
+        .replace("−", "-")
+        .replace("，", ",")
+        .replace("．", ".")
     )
+
+
+def normalize_alnum(text: str) -> str:
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.upper().replace(" ", "").replace("　", "")
+    return re.sub(r"[^0-9A-Z]", "", text)
+
+
+def normalize_digits(text: str) -> str:
+    if text is None:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    trans = str.maketrans(
+        {"O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "!": "1", "S": "5", "B": "8"}
+    )
+    text = text.translate(trans)
+    return re.sub(r"\D", "", text)
 
 
 def group_tokens_by_row(tokens: Iterable[OCRToken]) -> list[list[OCRToken]]:
@@ -125,7 +153,13 @@ def parse_yen(text: str | None) -> int | None:
     cleaned = normalize_text(text)
     numbers = re.findall(r"\d+(?:,\d{3})*", cleaned)
     if not numbers:
-        return None
+        digits = normalize_digits(cleaned)
+        if not digits:
+            return None
+        value = int(digits)
+        if value < 100000:
+            value *= 10000
+        return value
     value = int(numbers[0].replace(",", ""))
     if value < 100000:
         value *= 10000
@@ -138,7 +172,10 @@ def parse_mileage(text: str | None) -> tuple[int | None, int | None, str | None]
     cleaned = normalize_text(text)
     numbers = re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", cleaned)
     if not numbers:
-        return None, None, text
+        digits = normalize_digits(cleaned)
+        if not digits:
+            return None, None, text
+        numbers = [digits]
     raw = numbers[0]
     value = float(raw.replace(",", ""))
     multiplier = 1
@@ -152,7 +189,7 @@ def parse_mileage_header(text: str | None) -> tuple[int | None, int | None, floa
     if not text:
         return None, None, 0.0, None
     cleaned = normalize_text(text)
-    digits = re.sub(r"\D", "", cleaned)
+    digits = normalize_digits(cleaned)
     if not digits:
         return None, None, 0.0, text
     if "," in cleaned or len(digits) >= 4:
@@ -198,7 +235,8 @@ def parse_shift_engine(text: str | None) -> tuple[str | None, int | None]:
 def parse_equipment(text: str | None) -> str | None:
     if not text:
         return None
-    found = [code for code in EQUIPMENT_CODES if code in text]
+    normalized = normalize_text(text)
+    found = [code for code in EQUIPMENT_CODES if code in normalized]
     return " ".join(found) if found else None
 
 
@@ -256,6 +294,14 @@ def parse_sheet(tokens: list[OCRToken]) -> dict[str, ParsedField]:
     if not chassis_field:
         chassis_field = _find_regex_field(full_text, r"\b([A-HJ-NPR-Z0-9-]{8,20})\b")
     if chassis_field:
+        normalized = _normalize_chassis_value(str(chassis_field.value))
+        if normalized:
+            chassis_field = ParsedField(
+                value=normalized,
+                confidence=chassis_field.confidence,
+                bbox=chassis_field.bbox,
+                raw=chassis_field.raw,
+            )
         results["chassis"] = chassis_field
 
     mileage_field = _find_labeled_value(
@@ -513,12 +559,25 @@ def _is_clean_round(value: object) -> bool:
 def _extract_damage_codes(text: str) -> list[str]:
     if not text:
         return []
-    codes = re.findall(r"\b([A-Z]{1,2}\d)\b", text)
+    codes = re.findall(r"[A-Z]{1,2}\d", normalize_alnum(text))
     seen = []
     for code in codes:
         if code not in seen:
             seen.append(code)
     return seen
+
+
+def _normalize_chassis_value(value: str) -> str | None:
+    if not value:
+        return None
+    normalized = normalize_alnum(value)
+    if not normalized:
+        return None
+    # VINs avoid I/O/Q; map OCR confusions when seen.
+    normalized = normalized.replace("I", "1").replace("O", "0").replace("Q", "0")
+    if len(normalized) < 6:
+        return None
+    return normalized
 
 
 def _row_bbox(tokens: list[OCRToken]) -> tuple[int, int, int, int] | None:
@@ -550,7 +609,7 @@ def _find_labeled_value(
                     value_text = " ".join([t.text for t in next_tokens if t.text]).strip()
                     value_bbox = _row_bbox(next_tokens)
                 if value_regex and value_text:
-                    match = re.search(value_regex, value_text)
+                    match = re.search(value_regex, normalize_text(value_text))
                     if match:
                         value_text = match.group(0)
                 if value_text:
@@ -566,7 +625,7 @@ def _find_labeled_value(
 def _find_regex_field(text: str, pattern: str) -> ParsedField | None:
     if not text:
         return None
-    match = re.search(pattern, text)
+    match = re.search(pattern, normalize_text(text))
     if not match:
         return None
     value = match.group(1) if match.lastindex else match.group(0)
